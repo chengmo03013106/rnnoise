@@ -1,0 +1,120 @@
+# RNNoise README 中文翻译
+
+> 原文：`/Users/chengmo/Work/rnnoise/README`（RNNoise 官方仓库 README）
+> 本文件为该项目官方说明的中文译文，内容与原文一一对应。
+
+RNNoise 是一个基于循环神经网络的噪声抑制库。
+算法描述见以下论文：
+
+J.-M. Valin，《A Hybrid DSP/Deep Learning Approach to Real-Time Full-Band Speech Enhancement》，
+IEEE 多媒体信号处理（MMSP）研讨会论文集，arXiv:1709.08243，2018。
+https://arxiv.org/pdf/1709.08243.pdf
+
+0.1 版本的交互式演示见：https://jmvalin.ca/demo/rnnoise/
+
+编译只需输入：
+```
+% ./autogen.sh
+% ./configure
+% make
+```
+
+可选：
+```
+% make install
+```
+
+建议在 CFLAGS 中通过 `-march=` 指定支持 AVX2 的架构，或者在 configure 时加 `--enable-x86-rtcd`，
+这样至少可以把 AVX2（或 SSE4.1）作为一个可选项使用。
+注意：`autogen.sh` 脚本会自动从 Xiph.Org 服务器下载模型文件，因为这些文件太大，不适合放进 Git。
+
+虽然它被设计为一个库，但也提供了一个简单的命令行工具作为示例。它处理的是 48 kHz 采样、
+RAW 16-bit（机器字节序）单声道 PCM 文件。用法：
+
+```
+% ./examples/rnnoise_demo <含噪语音> <降噪后输出>
+```
+
+输出同样是 16-bit RAW PCM 文件。
+**再次强调：输入和输出都是 RAW 格式，不是 WAV。**
+
+最新源码见 https://gitlab.xiph.org/xiph/rnnoise ，GitHub 仓库只是为了方便而做的镜像。
+
+### 训练
+
+现在随 RNNoise 发布的模型，只使用下面列出的公开数据集、并按此处描述的训练流程训练得到。
+具体结果仍然取决于所用数据的确切配比、训练时长以及涉及的各个随机种子。
+
+训练一个 RNNoise 模型，你既需要干净语音数据，也需要噪声数据。两者都必须是 48 kHz 采样、
+16-bit PCM 格式（机器字节序）。
+干净语音可以从 `datasets.txt` 文件列出的数据集获取，也可以直接下载已经拼接好的版本：
+https://media.xiph.org/rnnoise/data/tts_speech_48k.sw
+噪声数据建议使用 https://media.xiph.org/rnnoise/data/ 上的 `background_noise.sw` 和
+`foreground_noise.sw`（或更新版本）。
+`foreground_noise.sw` 包含的是**叠加在**背景噪声之上的噪声信号（例如键盘声）。
+前景噪声文件甚至可以先用一个传统降噪器（如 libspeexdsp）处理一遍，只保留瞬态成分。
+就背景噪声而言，原始 RNNoise 噪声集中的数据现已经过充分筛选，效果不错——可以单独使用，
+也可以与 `background_noise.sw` 结合使用。该数据集（2025 年 1 月 30 日更新）可从
+https://media.xiph.org/rnnoise/rnnoise_contributions.tar.gz 下载。
+
+第一步是把语音和噪声以多种方式混合，模拟真实环境条件（包括停顿、滤波等）。
+假设文件名为 `speech.pcm` 和 `noise.pcm`，先生成训练特征数据：
+
+```
+% ./dump_features speech.pcm background_noise.pcm foreground_noise.pcm features.f32 <条数>
+```
+
+其中 `<条数>` 是要处理的序列数量。序列数至少应为 10000，越多越好（建议 200000 或更多）。
+
+训练时也可以选择模拟混响，这时还需要房间冲激响应（RIR）。有限的 RIR 数据见：
+https://media.xiph.org/rnnoise/data/measured_rirs-v2.tar.gz
+格式为 RAW 32-bit 浮点（小端）。假设所有 RIR 文件列表存放在 `rir_list.txt` 中，
+则生成训练特征数据的命令为：
+
+```
+% ./dump_features -rir_list rir_list.txt speech.pcm background_noise.pcm foreground_noise.pcm features.f32 <条数>
+```
+
+为了加快特征生成，可以使用 `script/dump_features_parallel.sh` 脚本
+（如果想加 RIR 增强，需要自行修改该脚本）。用法：
+
+```
+% script/dump_features_parallel.sh ./dump_features speech.pcm background_noise.pcm foreground_noise.pcm features.f32 <条数> rir_list.txt
+```
+
+它会启动 nb_processes 个进程，每个进程处理 count 条序列，并把输出拼接成单个文件。
+
+特征文件算好后，就可以开始训练：
+
+```
+% python3 train_rnnoise.py features.f32 output_directory
+```
+
+用 `--epochs` 选择一个能产生约 75000 次权重更新的 epoch 数。训练会生成 `.pth` 文件，
+例如 `rnnoise_50.pth`。下一步用下面的命令把模型转换为 C 文件：
+
+```
+% python3 dump_rnnoise_weights.py --quantize rnnoise_50.pth rnnoise_c
+```
+
+它会在 `rnnoise_c` 目录下生成 `rnnoise_data.c` 和 `rnnoise_data.h`。
+
+把这两个文件复制到 `src/`，然后按上面的说明重新构建 RNNoise。
+
+为了得到略好一点的效果，可以先用训练好的模型把"干净"训练语音中的残余噪声去掉一次，
+然后重新走一遍整个流程（这个操作最多做一次，不必重复）。
+
+### 可加载模型
+
+自 v0.1.1 起模型格式发生了变化。现在模型使用"机器字节序"的二进制格式。
+要以该格式输出模型，请用该模型构建 RNNoise，然后用 `dump_weights_blob` 可执行程序生成
+`weights_blob.bin` 二进制文件。该文件可配合 `rnnoise_model_from_file()` API 使用。
+注意：在 RNNoise state 存活期间，**模型对象绝不能被删除**，文件也**绝不能关闭**。
+
+如果不想把默认模型编进构建产物（例如为了减小下载体积）、完全依赖运行时加载，
+可以在 CFLAGS 中加 `-DUSE_WEIGHTS_FILE`。
+要能加载不同的模型，模型的大小（以及头文件）必须与构建时使用的大小一致，否则模型无法加载。
+我们还提供了一个参数量减半的 "little" 模型作为备选。使用小模型时，把
+`rnnoise_data_little.c` 重命名为 `rnnoise_data.c` 即可。
+由于 little 模型与常规模型尺寸相同（只是稀疏度更高），因此可以**同时**构建常规和小模型，
+并在运行时加载其中任意一个。
