@@ -27,7 +27,6 @@ noinst_HEADERS = src/arch.h  \
 		 src/x86/x86cpu.h \
 		 src/x86/dnn_x86.h \
 		 examples/rnn_unit.h \
-		 examples/rnn_unit_data.h \
 		 examples/rnn_unit_util.h
 
 RNNOISE_SOURCES = \
@@ -79,9 +78,16 @@ dump_rnn_io_SOURCES = src/denoise.c src/kiss_fft.c src/pitch.c src/celt_lpc.c sr
 dump_rnn_io_LDADD = $(LIBM)
 dump_rnn_io_CFLAGS = $(AM_CFLAGS)
 
+# 精度开关（刻意只加到 rnn_unit_CFLAGS，不动全局 AM_CFLAGS）：
+#   空（默认）                              -> 低精度：多项式近似 + _mm256_rcp_ps
+#   RNN_UNIT_HIGH_ACCURACY=-DHIGH_ACCURACY  -> 高精度：1.f/(1+exp(-x)) / tanhf
+# 为什么够用：automake 会把 src/nnet_default.c 编成 per-target 对象
+# src/rnn_unit-nnet_default.o，它的编译行用的就是 $(rnn_unit_CFLAGS)；
+# 而 HIGH_ACCURACY 正是在 nnet_default.c 包含 src/nnet_arch.h 时（第 77 行）生效。
+RNN_UNIT_HIGH_ACCURACY =
 rnn_unit_SOURCES = examples/rnn_unit.c examples/rnn_unit_util.c src/nnet.c src/x86/x86_dnn_map.c src/nnet_default.c
 rnn_unit_LDADD = $(LIBM)
-rnn_unit_CFLAGS = $(AM_CFLAGS) -g 
+rnn_unit_CFLAGS = $(AM_CFLAGS) -g $(RNN_UNIT_HIGH_ACCURACY)
 
 
 pkgconfigdir = $(libdir)/pkgconfig

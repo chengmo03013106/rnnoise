@@ -14,8 +14,13 @@
     uv run scripts/unit_check.py -v conv1d        # 附带双方原始输出
     uv run scripts/unit_check.py --py /path/to/python conv1d
 
-用例数据：scripts/unit_cases/<unit>.json。两侧程序自己按约定去这个路径找，
-驱动器只负责把路径显式传下去并核对「双方是不是读了同一份数据」。
+用例数据：scripts/unit_cases/*.json，一个文件里可能放着同一算子的多层参数
+（conv.json 装 conv1 / conv2，gru.json 装 gru1 / gru2 / gru3）。
+单元名取 JSON 里的 "unit" 字段，所以文件名不一定等于单元名；
+**没有 "unit" 字段的 json 当纯参数文件跳过**（dense.json 只有输出层权重，没有可跑的输入）。
+驱动器把路径显式传给两侧，并核对「双方是不是读了同一份数据」。
+
+两侧都是严格模式：读不到用例 / 必需字段对不上就报错退出，没有保底数据。
 """
 
 import argparse
@@ -143,28 +148,16 @@ def sort_key(key):
 
 
 def data_source(stderr_text):
+    """从两侧的 stderr 里取「读了哪个用例文件」，用来核对双方读的是不是同一份。"""
     for line in stderr_text.splitlines():
-        if "case data:" in line:
-            return line.split("case data:", 1)[1].strip()
+        if "case file:" in line:
+            return line.split("case file:", 1)[1].strip()
     return "?"
 
 
 def last_line(text):
     lines = [l for l in text.splitlines() if l.strip()]
     return lines[-1] if lines else ""
-
-
-def short_src(src):
-    """显示用：去掉冗长的路径。"""
-    return src.split(" path=")[0]
-
-
-def all_builtin(src):
-    """三个字段是否全部退回了内置保底数据。
-
-    注意要先去掉 path —— 用例文件名本身就以 .json 结尾，会干扰判断。
-    """
-    return "json" not in short_src(src)
 
 
 # --------------------------- 比对 ---------------------------
@@ -184,14 +177,13 @@ def compare_item(cv, pv, tol):
     return ("PASS" if not bad else "FAIL"), max_abs, max_rel, bad
 
 
-def render_unit(unit, c_items, p_items, tol, verbose, src_c, src_py,
+def render_unit(unit, c_items, p_items, tol, verbose,
                 case_path=None, out=sys.stdout):
     keys = sorted(set(c_items) | set(p_items), key=sort_key)
 
     out.write("\n")
     out.write("%s  %s\n" % (bold(unit), dim("tol=%.1e" % tol)))
-    out.write(dim("  case: %s" % (os.path.relpath(case_path, ROOT) if case_path else "-")))
-    out.write(dim("   src : %s\n" % short_src(src_c)))
+    out.write(dim("  case: %s\n" % (os.path.relpath(case_path, ROOT) if case_path else "-")))
     out.write(dim("  %-24s %4s %13s %13s  %s\n" % ("item", "n", "max|Δ|", "max|Δ|rel", "result")))
 
     n_pass = n_fail = 0
@@ -263,9 +255,30 @@ def render_unit(unit, c_items, p_items, tol, verbose, src_c, src_py,
 # --------------------------- 主流程 ---------------------------
 
 def discover_units():
+    """扫描用例目录，返回 {单元名: 用例路径}。
+
+    单元名取 JSON 里的 "unit" 字段（文件名因此不等于单元名：conv.json 对应单元 conv1d）。
+    **没有 "unit" 字段的 json 一律当纯参数文件跳过** —— 比如 dense.json，它只有
+    输出层的权重，没有可独立跑的输入，参与不了"两侧跑同一组数据再逐项对比"。
+    """
+    index = {}
     if not os.path.isdir(CASES_DIR):
-        return []
-    return sorted(f[:-5] for f in os.listdir(CASES_DIR) if f.endswith(".json"))
+        return index
+    for name in sorted(os.listdir(CASES_DIR)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(CASES_DIR, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                unit = json.load(fh).get("unit")
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            print(yellow("跳过 %s：读不出 unit 字段（%s）" % (name, exc)))
+            continue
+        if not isinstance(unit, str) or not unit:
+            print(dim("跳过 %s：没有 unit 字段，按纯参数文件处理" % name))
+            continue
+        index[unit] = path
+    return index
 
 
 def main(argv):
@@ -287,21 +300,29 @@ def main(argv):
         print(dim("  也可以 --py <解释器路径> 或设置 RNN_PYTHON。"))
         return 2
 
-    units = args.units or discover_units()
-    if not units:
-        print(red("scripts/unit_cases 下没有 .json 用例；用命令行显式指定单元名"))
-        return 2
+    index = discover_units()
+    if args.units:
+        missing = [u for u in args.units if u not in index]
+        if missing:
+            print(red("找不到这些单元的用例文件: %s" % ", ".join(missing)))
+            print(dim("  scripts/unit_cases 下现有: %s" % ", ".join(sorted(index)) or "-"))
+            return 2
+        units = list(args.units)
+    else:
+        if not index:
+            print(red("scripts/unit_cases 下没有 .json 用例；用命令行显式指定单元名"))
+            return 2
+        units = sorted(index)
 
     print(dim("C      : %s" % C_BIN))
     print(dim("python : %s (%s)" % (py, "examples/rnn_unit.py")))
 
-    total_pass = total_fail = n_builtin = 0
+    total_pass = total_fail = 0
     for unit in units:
-        case_path = os.path.join(CASES_DIR, "%s.json" % unit)
-        has_case = os.path.isfile(case_path)
+        case_path = index[unit]
 
         tol = args.tol
-        if tol is None and has_case:
+        if tol is None:
             try:
                 with open(case_path, "r", encoding="utf-8") as fh:
                     tol = float(json.load(fh).get("tolerance", DEFAULT_TOL))
@@ -310,8 +331,8 @@ def main(argv):
         if tol is None:
             tol = DEFAULT_TOL
 
-        rc = run([C_BIN, unit] + ([case_path] if has_case else []))
-        rp = run([py, PY_SCRIPT, unit] + ([case_path] if has_case else []))
+        rc = run([C_BIN, unit, case_path])
+        rp = run([py, PY_SCRIPT, unit, case_path])
 
         c_items = parse(rc.stdout)
         p_items = parse(rp.stdout)
@@ -329,26 +350,11 @@ def main(argv):
             total_fail += 1
             continue
 
-        # 逐字段来源必须完全一致，否则比的是两份不同的数据
+        # 两侧读的必须是同一份用例文件，否则比的是两份不同的数据
         if src_c != src_py:
-            print(yellow("\n%s: 数据来源不一致！C=%s / py=%s" % (unit, src_c, src_py)))
+            print(yellow("\n%s: 用例文件不一致！C=%s / py=%s" % (unit, src_c, src_py)))
 
-        # 两侧都退回保底：结论是空的，必须显眼地说出来，不能让人以为"测过了"
-        if all_builtin(src_c) and all_builtin(src_py):
-            n_builtin += 1
-            print("\n" + red("=" * 60))
-            print(red("%s: 两侧都在用内置保底数据，本次对比不验证真实用例数据！" % unit))
-            if not has_case:
-                print(red("  没找到用例文件: %s" % case_path))
-                print(dim("  新建该文件后重跑即可；字段约定见 doc/补充学习手册.md 第一节"))
-            else:
-                print(red("  用例文件存在但没被读进去: %s" % case_path))
-            print(red("=" * 60))
-        elif all_builtin(src_c) or all_builtin(src_py):
-            print(yellow("\n%s: 有一侧退回了内置保底数据，请确认这是预期的" % unit))
-
-        n_pass, n_fail = render_unit(unit, c_items, p_items, tol, args.verbose,
-                                     src_c, src_py, case_path)
+        n_pass, n_fail = render_unit(unit, c_items, p_items, tol, args.verbose, case_path)
         total_pass += n_pass
         total_fail += n_fail
 
@@ -357,8 +363,6 @@ def main(argv):
         print(green("全部通过：%d 项" % total_pass))
     else:
         print(red("失败 %d 项，通过 %d 项" % (total_fail, total_pass)))
-    if n_builtin:
-        print(red("其中 %d 个单元跑在内置保底数据上，这些单元的结论不算数" % n_builtin))
     return 1 if total_fail else 0
 
 

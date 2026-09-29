@@ -289,7 +289,6 @@ H = z*(H_t-1) + (1-z)* H_candicate
 这里没有提到 bias，因为 compute_linear() 中处理了 bias，为了减少冗余没有表达。
 除此之外，与GRU的公式一致
 
-
 以下是看代码后的推测，没有实践确认
 
 conv1 
@@ -355,3 +354,107 @@ input [conv2_out|gru1_state|gru2_state|gru3_state] 💡 注意，这里没有 co
 output float
 
 ---
+
+自己使用pytorch实现 GRU，与 RNNoise c 中的 compute_generic_gru 实现对齐，最终输出的隐状态数据不同，通过一步步打印定位问题；在tensor 通过 sigmoid之前对比，数据相同，但是 通过 RNNoise sigmoid 和 torch.sigmoid 后，两边的结果出现差别。
+1. 如何进一步定位问题？验证自己的实现正确而内部实现有差距？
+2. 是否有官方说明 RNNoise c 使用的激活函数 与 torch 中的激活函数 实现不同？底层差别在哪导致计算结果不同
+3. 除了 sigmoid 外，其他的激活函数是否还有这种问题？ 
+4. 为了继续推动我的学习计划，是否需要手动实现 sigmoid，tanh 等激活函数，保证c与 python 一致？
+以下是我的 python 代码，已经确认 inputs_data, params, hidden 都相同
+
+    h_comp = hidden.clone()
+    hidden_size = h_comp.shape[0]
+    W_xzrh, W_hzrh, b_xzrh, b_hzrh = params
+
+    for step, X in enumerate(inputs_data):  # X: [B, F]
+        # 重置门：控制上一轮隐状态有多少参与"生成候选状态"
+
+        # 一次计算 zrh，因为公式中三个参数都和X矩阵相乘 ()
+        zrh = X @ W_xzrh + b_xzrh #   compute_linear(input_weights, zrh, in, arch);
+        print(f'X@zrh+bias: {zrh}\n')
+        # 一次计算 zrh，因为公式中三个参数都和 hidden_t-1 矩阵相乘
+        recur = hidden @ W_hzrh + b_hzrh #   compute_linear(recurrent_weights, recur, state, arch);
+        print(f'hidden@zrh+bias: {recur}\n')
+
+        #   for (i=0;i<2*N;i++)
+        #       zrh[i] += recur[i];
+        #   compute_activation(zrh, zrh, 2*N, ACTIVATION_SIGMOID, arch);
+        print(f'zrh+recur: {zrh[:hidden_size*2] + recur[:hidden_size*2]}\n')
+        zrh[:hidden_size*2] = torch.sigmoid(zrh[:hidden_size*2] + recur[:hidden_size*2])              # [B, H]，收敛到 (0, 1)
+        print(f'sigmoid(zrh+recur): {zrh[:hidden_size*2]}\n')
+        pdb.set_trace()
+        #   for (i=0;i<N;i++)
+        #       h[i] += recur[2*N+i]*r[i];        
+        r = zrh[hidden_size:hidden_size*2]
+        h = recur[hidden_size*2:]*r
+        
+        h_candidate = torch.tanh(h)
+
+        #for (i=0;i<N;i++)
+        #    h[i] = z[i]*state[i] + (1-z[i])*h[i];
+        
+        #for (i=0;i<N;i++)
+        #    state[i] = h[i];
+
+        z = zrh[:hidden_size]
+        h = z * hidden + (1 - z) * h_candidate
+        print(f'state {step}: {h.data}')
+        hidden = h # 把新状态传给下一个时间步
+
+NNoise 官方当前源码以及 PyTorch 当前实现。结论非常明确：
+
+> RNNoise 的 ACTIVATION_SIGMOID 默认并不是直接计算数学定义的 1 / (1 + exp(-x))。它使用的是专门设计的近似 sigmoid；PyTorch 的 torch.sigmoid() 则按 sigmoid 定义计算。
+
+测试证明 
+C 如果没有定义 High Accuracy， 实现不是使用 sigmoid 公式 : `float exact = 1.0f / (1.0f + exp(-x));` 即便开启了 High Accuracy ， 和 pytorch 还是有 1e-8 误差
+
+pytorch 实现 
+``` python
+torch.set_printoptions(sci_mode=True,precision=8)
+x = torch.tensor([0.371234], dtype=torch.float32)
+
+assert torch.sigmoid(x) == (1.0 / (1.0 + torch.exp(-x))) # 通过
+
+```
+
+原因1 
+因为 RNNoise 是实时音频系统。在数学精确度和性能便宜的SIMD计算 做 trade off， `rnnoise/main/src/vec_avx.h` 直接说明了激活函数 tanh，sigmoid 误差存在且说明了范围
+
+原因2
+ ① x86 AVX 架构， FMA fused multiply-add a*b+c 是一次指令完成，而不是先加再乘
+ ② reciprocal approximation
+
+ 完成对比实验
+
+
+任务: GRU神经网络计算过程误差对比统计
+背景：
+1. rnn_unit.c 文件中函数 local_compute_generic_gru() 已经包含了打印输出，打印函数 print_item，打印内容如代码中显示。
+2. rnn_unit.py 文件中引用 gru_scratch.py 中的 GRUScratch类，执行 do_rnnoise_gru() 函数，打印内容如代码中显示。python中激活函数 sigmoid，tanh 有两种实现，高精度 torch包中自带，低精度在 gru_scratch.py 中手工实现。
+3. C代码中 高精度与低精度需要修改 Makefile.am AM_CFLAGS 变量区别， -DHIGH_ACCURACY 即高精度，否则是低精度。
+4. 统计 C，python 程序，同样是高精度的情况下，打印输出的值是否存在误差，记录误差。同样在低精度下，打印输出的几个值是否存在误差，记录误差值。
+5. 分别统计 C 代码/python代码中 高精度/低精度情况下，各自的 sigmoid(zrh+recur) 的 最大偏差和平均差
+
+python 文件使用 uv run 执行，c代码编译后直接执行
+全部记录最终记录到 doc/下一个文件中
+
+先启动 agent A 分析我的问题，对任务进行规划，如果有不明确的地方提出问题，让我回答，不要胡乱推测。如果认为我的描述有问题，任务不全面，也提出问题。
+确认无误后 Agent A 设计整体任务方案，验收指标。启动 agent B 对方案进行review，检查合理性。有问题修改，直到统一后开始执行任务。
+Agent A 负责执行任务，完成后，agent B进行结果验收提出问题，修正问题。两个Agent都不确定的问题，跑出来让我回答。
+全部任务完成后，告诉我这次的任务哪部分是你最没把握的
+
+9月28日
+今天我已经完成了 GRU python 的实现。
+了解了C中的实现方式，按照c的实现方式实现的python版本。
+并且对比了 python与c代码跑相同数据的差异，发现在C代码中，使用高精度，低精度时分别与 torch sigmoid，tanh 都会有误差。我自己手动实现了低精度的 python版本 sigmoid tanh，并且也做了对比实验。对比了 state 的偏差
+
+现在的进度是不是比原进度快一些，请按照当前进度，对后续的学习进阶进度重新进行排期，但是不要遗漏删减任何内容。学习进度可以保守，但是最终目标一定要明确。
+
+我的学习设备，也需要考虑。我有一台 mac x86笔记本，配置比M1略低 一台台式机 windows，安装了 WSL2，配置比和笔记本相当，好一点但有限 安排学习计划时，请附加说明每一个学习内容是否可以用已有环境完成？ 你提到了GPU，RDMA 等，并不是我当前的设备就可以完成？ 我是在家gap期间补充知识准备就业，请考虑这一点，不要不切实际的规划蓝图
+
+9月29日  大串联 
+
+conv1
+24960 = 195*128
+
+147456 = 384x384

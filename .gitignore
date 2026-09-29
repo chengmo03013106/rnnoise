@@ -1,4 +1,7 @@
 .codebuddy/
+scripts/err_stats/
+*.dir/
+*.file/
 .workbuddy/
 autom4te.cache/
 __pycache__/
