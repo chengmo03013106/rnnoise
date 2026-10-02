@@ -33,7 +33,8 @@ import sys
 
 import torch
 from torch import nn as nn
-from gru_scratch import GRUScratch as GRUScratch
+from gru import GRUScratch as GRUScratch
+from rnnoise_activation import pick
 
 NB_FRAMES = 16          # 必须和 examples/rnn_unit.c 的 NB_FRAMES 一致
 
@@ -258,14 +259,6 @@ def emit(unit, output, frame, values, out=sys.stdout):
         " ".join("%.8e" % float(v) for v in values),
     ))
 
-
-# ===================== 待补单元 =====================
-# conv1d / gru 跑通后按同样的模式往下加：
-#   - linear_demo     : compute_linear   (sgemv / cgemv8x4 / sparse_*)
-#   - dense_demo      : compute_generic_dense
-#   - activation_demo : compute_activation (tanh_approx / sigmoid_approx)
-
-
 class Linear(nn.Module):
     def __init__(self,nb_input,nb_output,case):
         super().__init__()
@@ -298,23 +291,25 @@ def linear_demo(cases, low_accuracy=False):
     print(out_data)
 
 class DenseLayer():
-    def __init__(self,nb_input,nb_output,case):
+    def __init__(self,nb_input,nb_output,case,low_accuracy=True):
         super().__init__()
         self.linear = Linear(nb_input, nb_output, case)
-        self.active = torch.sigmoid
+        # 高/低精度只换激活函数：low -> rnnoise_activation 的多项式，high -> torch.sigmoid
+        self.active = pick(low_accuracy)[0]
 
     def __call__(self,data):
         return self.active(self.linear(data))
 
 class Conv1D(nn.Module):
-    def __init__(self,nb_input,nb_output,case,input_size):
+    def __init__(self,nb_input,nb_output,case,input_size,low_accuracy=True):
         # input_size * kernel_size = nb_inputs
         super().__init__()
         self.mem_size = nb_input - input_size
         self.input_size = input_size
         self.mem = torch.zeros(self.mem_size)
         self.linear = Linear(nb_input, nb_output, case)
-        self.active = torch.tanh
+        # 高/低精度只换激活函数：low -> rnnoise_activation 的 tanh 多项式，high -> torch.tanh
+        self.active = pick(low_accuracy)[1]
 
     def forward(self, data):
         assert data.numel() == self.input_size
@@ -331,13 +326,13 @@ class Conv1D(nn.Module):
 # 同一份实现被 conv1 / conv2 两层复用，两层规模不同（见 CONV_LAYERS），
 # 所以这里按层循环：每层各自读用例、各自跑、各自打 [<层名>.out#帧] / [<层名>.mem#帧]。
 
-def conv1d_demo(cases, low_accuracy=False, out=sys.stdout):
-    # 注意：conv1d 这条路径不受 --acc 影响（C 侧 conv1d 恒走 tanh，
-    # 这里恒走 torch.tanh），low_accuracy 只是为了统一调用签名。
+def conv1d_demo(cases, low_accuracy=True, out=sys.stdout):
+    # 激活也受 --acc 控制：low -> rnnoise_activation 的 tanh 多项式（= C 默认），
+    # high -> torch.tanh（= C 的 -DHIGH_ACCURACY）。
     # 每层各自读用例、各自跑（conv2 在用例里没有 inputs，那一层就跳过了）。
     for layer, in_size, nb_out in CONV_LAYERS:
         case = cases[layer]
-        net = Conv1D(in_size * 3, nb_out, case, in_size)
+        net = Conv1D(in_size * 3, nb_out, case, in_size, low_accuracy=low_accuracy)
         for frame, raw in enumerate(case["inputs"]):
             x = torch.tensor(raw, dtype=torch.float32)
             out_data = net(x)
@@ -367,7 +362,7 @@ def gru_demo(cases, low_accuracy=True, out=sys.stdout):
 
     协议行与 examples/rnn_unit.c 的 local_compute_generic_gru() 同名同序，
     方便 scripts/unit_check.py 直接配对。
-    low_accuracy=True  -> gru_scratch 里手写的多项式近似（对应 C 默认）
+    low_accuracy=True  -> rnnoise_activation 里手写的多项式近似（对应 C 默认）
     low_accuracy=False -> torch 自带 sigmoid/tanh（对应 C 的 -DHIGH_ACCURACY）
 
     同一份实现被 gru1 / gru2 / gru3 三层复用，三层规模相同，所以这里按层循环，
@@ -407,8 +402,10 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
     input_features = cases['conv1']['nb_in']
     nb_out = cases['conv1']['nb_out']
 
-    conv1 = Conv1D(input_features * 3, nb_out, cases['conv1'], input_features)
-    conv2 = Conv1D(nb_out * 3, nb_out*3, cases['conv2'], nb_out)
+    conv1 = Conv1D(input_features * 3, nb_out, cases['conv1'], input_features,
+                   low_accuracy=low_accuracy)
+    conv2 = Conv1D(nb_out * 3, nb_out*3, cases['conv2'], nb_out,
+                   low_accuracy=low_accuracy)
 
     # ['layer', 'input_weights_float', 'input_bias', 'recurrent_weights_float', 'recurrent_bias', 'state', 'inputs']
     gru1_case = cases['gru1']
@@ -416,16 +413,19 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
     gru_out_size = gru_input_size * 3
 
     gru1 = GRUScratch(gru_input_size, hidden_size, gru_out_size,
-                    gru1_case, layer=gru1_case['layer'])
+                    gru1_case, layer=gru1_case['layer'], detail=False)
     
     gru2 = GRUScratch(gru_input_size, hidden_size, gru_out_size,
-                    cases['gru2'], layer=cases['gru2']['layer'])
+                    cases['gru2'], layer=cases['gru2']['layer'], detail=False)
     
     gru3 = GRUScratch(gru_input_size, hidden_size, gru_out_size,
-                    cases['gru3'], layer=cases['gru3']['layer'])
+                    cases['gru3'], layer=cases['gru3']['layer'], detail=False)
 
-    # dense = DenseLayer(hidden_size*3 + nb_out, 4, cases['dense_out'])
-    # vad_dense = DenseLayer(hidden_size*3 + nb_out, 1, cases['vad_dense'])
+    dense = DenseLayer(hidden_size*3 + nb_out*3,
+                       int((hidden_size*3 + nb_out*3)/(1536/32)), cases['dense_out'],
+                       low_accuracy=low_accuracy)
+    vad_dense = DenseLayer(hidden_size*3 + nb_out*3, 1, cases['vad_dense'],
+                           low_accuracy=low_accuracy)
 
     inputs_data = torch.tensor(cases['conv1']['inputs'], dtype = torch.float32)
 
@@ -435,26 +435,27 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
         conv1_output = conv1(data)
         
         print(f'conv1 {frame}:{conv1_output}')
+        emit('conv1', "out", frame, conv1_output[0], out)
         
         conv2_output = conv2(conv1_output.flatten())
-        print(f'conv2 {frame}:{conv2_output}')
+        emit('conv2', "out", frame, conv2_output[0], out)
         
         gru1_state = gru1(conv2_output.flatten(), low_accuracy=low_accuracy, out=out, frame=frame)
-        print(f'gru1 {frame}:{gru1_state}')
 
         gru2_state = gru2(gru1_state, low_accuracy=low_accuracy, out=out, frame=frame)
-        print(f'gru2 {frame}:{gru2_state}')
 
         gru3_state = gru3(gru2_state, low_accuracy=low_accuracy, out=out, frame=frame)
-        print(f'gru3 {frame}:{gru3_state}')
         dense_in = torch.cat((conv2_output.flatten(), gru1_state.flatten(), gru2_state.flatten(), gru3_state.flatten()), dim=0)
-        # dense
-        # gains = dense(dense_in)
-        # print(f'gains:{gains}')
-        # vad
-        # vad = vad(dense_in)
-        # print(f'vad:{vad}')
+        # 拼给 dense / vad 的输入（对应 C 的 [dense.in#帧]）
+        emit('dense', "in", frame, dense_in, out)
 
+        # dense
+        gains = dense(dense_in)
+        emit('dense', "gains", frame, gains[0], out)
+
+        # vad
+        vad = vad_dense(dense_in)
+        emit('vad', "out", frame, vad[0], out)
 
 
 UNITS = {

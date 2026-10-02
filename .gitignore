@@ -1,5 +1,5 @@
 .codebuddy/
-scripts/err_stats/
+scripts/err_stats/raw_all/
 *.dir/
 *.file/
 .workbuddy/

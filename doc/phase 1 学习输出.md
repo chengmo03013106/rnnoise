@@ -443,7 +443,7 @@ python 文件使用 uv run 执行，c代码编译后直接执行
 Agent A 负责执行任务，完成后，agent B进行结果验收提出问题，修正问题。两个Agent都不确定的问题，跑出来让我回答。
 全部任务完成后，告诉我这次的任务哪部分是你最没把握的
 
-9月28日
+## 9月28日
 今天我已经完成了 GRU python 的实现。
 了解了C中的实现方式，按照c的实现方式实现的python版本。
 并且对比了 python与c代码跑相同数据的差异，发现在C代码中，使用高精度，低精度时分别与 torch sigmoid，tanh 都会有误差。我自己手动实现了低精度的 python版本 sigmoid tanh，并且也做了对比实验。对比了 state 的偏差
@@ -458,3 +458,496 @@ conv1
 24960 = 195*128
 
 147456 = 384x384
+
+## 9月30日
+任务
+1. gru_scratch.py 函数 _check_sigmoid_diff，_rnnoise_sigmoid_approx， _rnnoise_tanh_approx 放到单独的文件
+2. gru_scratch.py 改名 gru.py
+3. 原 gru_scratch.py， rnn_unit.py 中使用 tanh，sigmoid 的位置，都支持高/低 精度，使用开关作区分。
+4. 对 python rnn_unit 与 C语言 rnn_unit 进行误差分析
+ - 在conv.json 中"inputs" 有16帧数据作为输入
+ - 对比分组包括
+    - 高精度 python vs c
+    - 低精度 python vs c
+    - 高精度 python vs 低精度 python
+    - 高精度 c vs 低精度 c
+ - c代码 conv_gru_unit()，python rnnoise_demo() 中已经对关键层处理结果进行了输出。我希望对c代码和我实现的代码作误差分析，直接通过输出的方式做对比，这种方式是否科学？是否有更好的方式？
+ - 每一帧（轮） 的所有层输出数据都要进行对比，记录误差值
+ - 对产生的误差进行根因分析
+- 统计口径 teacher forcing
+
+执行方式：
+5. 启动一个agent进行任务拆解，生成任务跟进文档，按照文档逐一到作，完成一件任务作标记。另一个agent对任务跟进文档进行review，对代码修改进行review，对精度报告进行review
+6. 如果两个agent 都不能确定的问题，提出问题让我回答，不要无根据推测
+7. 全部任务中我哪些地方考虑不足，提出问题
+
+我已经完成网络结构编码，实现了低精度tanh，sigmoid，每一层数据对比打印输出。
+高低精度，c/python pairwise error 对比的工作中，分组执行程序，高低精度切换，数据写入文件，误差计算这些工作，我让AI agent 替我完成，，逐条记录，我最终会review，对每个分组数据我会逐条解读，分析问题，定位差异。这样的方式是否可以？
+是否变成了都交给AI，我自己什么都没有学到？
+
+### 名词学习
+
+#### 逐层 teacher forcing 隔离
+每一层单独测试，隔离每一层带来的误差
+- free-running: 自回归，用自己的真实数据作下一步的入参
+- teacher forcing: python 中使用 c的输出作输入，每一层都能保证使用统一的输入
+
+#### 单算子微基准
+拆分 sigmoid， tanh， linear weights，bias
+
+### 学习 
+- python 高低精度 2.5e-5
+- “真值” 数学意义上的值 sigmoid = 1/(1+e^-x) 
+- ulp是最低有效单位
+- c 和 py 不能循环论证，必须有一个基准。
+- 1/(1+e^-x) 这个公式，如果全程使用 float32计算，结果会误差1-2个ulp，如果全部使用 float64(double) 最后转换成float32，误差会小的多，得到的是“最近的那个float32”
+- c中的exp()精度提升到double，所以实测 Δ = 0.000e+00
+- C float vs PyTorch float32 可能不同
+    - CPU instruction
+    - 编译器
+    - FMA
+    - 中间结果
+    - evaluation order
+    - SIMD
+
+更看重 **误差在合理范围 + 误差来源可以解释**
+
+故意造错：对比 c vs python， 把 weight transpose。
+
+去掉 bias
+
+C sigmoid 换成 pytroch sigmoid 
+
+state update 位置故意错误
+
+FP32 → FP16 精度变化 或者使用你已经实现的低精度 activation。
+
+**然后观察** 每一种错误的“误差指纹”有什么区别。
+**这个实验非常值钱。** 因为以后真正出现： ORT != PyTorch 你就有了一套排查思维。
+
+
+
+## 验收输出：
+
+计算图 
+
+
+按照你这套 **65 → 128 → 384 → 3×384 → 1536 → output** 的版本，建议画成：
+
+```text id="k2c1t4"
+                    input
+                 (1, 65)
+                     │
+                     │
+             ┌───────▼────────┐
+             │    Conv1D #1   │
+             │ kernel = 3     │
+             │ 195 → 128      │
+             └───────┬────────┘
+                     │
+                (1,128)
+                     │
+             ┌───────▼────────┐
+             │    Conv1D #2   │
+             │ kernel = 3     │
+             │ 384 → 384      │
+             └───────┬────────┘
+                     │
+                (1,384)
+                     │
+             ┌───────▼────────┐
+             │      GRU1      │
+             │ hidden = 384   │
+             └───────┬────────┘
+                     │
+                (1,384)
+                     │
+             ┌───────▼────────┐
+             │      GRU2      │
+             │ hidden = 384   │
+             └───────┬────────┘
+                     │
+                (1,384)
+                     │
+             ┌───────▼────────┐
+             │      GRU3      │
+             │ hidden = 384   │
+             └───────┬────────┘
+                     │
+                (1,384)
+                     │
+       ┌─────────────┼─────────────┐
+       │             │             │
+    Conv2 output   GRU1 state   GRU2 state  GRU3 state
+       │             │             │          │
+       └─────────────┴─────────────┴──────────┘
+                         │
+                    concat
+                         │
+                    (1,1536)
+                    /          \
+                   /            \
+             Dense Out          VAD
+                │                │
+             sigmoid          sigmoid
+                │                │
+             (1,32)            (1,1)
+```
+
+这里你还要特别标出：
+
+```text
+Conv1 state
+Conv2 state
+
+GRU1 state
+GRU2 state
+GRU3 state
+```
+
+因为这些 state 是**跨 frame 保留的**。
+
+标准的计算图应该是什么样的？给出一些中文权威计算图连接，我俩节的计算图，方形表示变量，圆形表示算子计算，和你给出的图似乎不一样。
+
+验收问答
+> 一个 Tensor 从输入到输出经过什么 shape？
+一个 Tensor 输入数据，batch_size = 1, 1帧数据， 65 features, (1,65)
+
+依次经过 
+1. conv1d W.shape=(195,128)，kernel size=3， input=195， output=128，
+
+❌ state 保存当前t时刻，t-1，t-2的输入，把这个输入作为下一层的输出。输出 Tensor shape = (1，128) 
+当前输入是 X_t, state 保存的是 X_t-2, X_t-1
+tmp = [x_(t-2), x_(t-1), x_t]
+处理完成后，保存 state： `state ← [x_(t-1), x_t]`
+
+
+2. conv1d W.shape=(384,384)， kernel size=3，**上一层输出是128， 本层layer.nb_input=3*128**，conv1 output[128] state[t-2|t-1], cat(conv1output,state)，所以input_size=384，output_size=384, Tensor shape (1,384)
+
+3. gru1
+三段内存 z，r，h拼接到一起，z，r，h的bias，W 拼接成一份连续的内存
+input=384, output=1152, c实现中，把zrh拼接到一块内存计算，[W_xz|W_xr|W_xh].shape(384, 1152) 输入的数据 shape(1,384), 得到 [x@W_xz|x@W_xr|x@W_xh] (1,1152)
+bias=[b_z|b_r|b_h]，用于矩阵与向量相加
+隐状态 H_t-1 shape(1,384)，矩阵 [W_hz|W_hr|W_hh] 矩阵乘法 的到 [H_t-1@W_hz|H_t-1@W_hr|H_t-1@W_hh] shape(1,1152)
+z，r 使用**激活函数 sigmoid**
+
+H_cand = (X@W_xh)[第一段内存的第三部分] + r[第一段内存]*(H_t-1@W_hh)[第二段内存的第三部分] + b_h 
+**激活函数 tanh**
+
+H_new = z*(H_t-1) + (1-z)@(H_cand), H_new作为输出，用于下一个gru的输入。 
+H_new shape(**1,384**)， H_new, H_candicate 与 Input shape 相同，权重才是384，384
+
+```
+GRU1:
+input = Conv2 output
+state = GRU1 previous state
+
+GRU2:
+input = GRU1 current output/state
+state = GRU2 previous state
+
+GRU3:
+input = GRU2 current output/state
+state = GRU3 previous state
+```
+
+6. dense out
+input=1536, output=32, MLP+激活，最终Tensor shape(1,32)
+👀 注意 sigmoid 激活函数
+
+7. vad
+input=1536, output = 1 
+
+---
+
+> ⚠️ 为什么有 Conv1D ？？？？？？？？？
+❌ 缩小数据范围，195->128，tanh 把数据做收敛到(-1,1) 的范围内
+
+✅  Conv1D 在时间维度上引入局部上下文。kernel size=3，因此当前时刻的计算同时使用当前帧和前两帧的数据；C 实现通过 state 保存历史帧，再将三帧拼接后进行一次线性变换。195→128 是该层具体参数配置造成的维度投影，而不是 Conv1D 必然具有的性质。随后使用 tanh 提供非线性。
+
+**Conv1D 的核心意义=提供时间局部感受野**
+**tanh 非线性激活**
+
+
+> 为什么 Conv1D 有 state？
+通过 state 记录三次数据，通过这种方法行程 kernel_size=3的卷积层。
+实现 kernel_size=3的卷积层，保存t-2，t-1，t 时刻数据，作为MLP的数据数据
+
+**卷积的 state 是作为数据缓冲区使用，保留最近两次历史记录**
+
+> 为什么有 GRU？
+❌ 处理与时序相关的输入数据，使用RNN，GRU具有RNN的能力，同时解决梯度消失与梯度爆炸的问题。
+说的太绝对
+
+✅ GRU 通过 reset/update gates 改善普通 RNN 对长期依赖的建模能力，并在训练过程中缓解普通 RNN 中常见的梯度消失问题；它不能保证彻底消除梯度消失或梯度爆炸。
+
+> 为什么 GRU 有 state？
+隐状态，为了解决某些场景，当前数据必须依赖历史数据的情况。 携带历史信息到，与接下来到来的数据作计算，使得当前信息中包含了历史信息。
+
+
+数值
+> 为什么 C 和 PyTorch sigmoid/tanh 不完全一致？
+C在编译过程中可能开启-O2优化， -march=native 从而使用SIMD 提高运算性能，这种方式与python的计算底层实现有区别。
+tanh，sigmoid 实现都需要倒数计算，倒数计算在C，python中使用不同的实现方式。
+
+算子问题 
+> compute_linear 做什么， 在哪一层被调用？
+对输入数据做线性计算。输入数据与权重做矩阵乘法，结果与bias做加法。
+
+> compute_generic_conv1d 做什么？
+通过 state 实现了 kernel_size = 3的卷积层，把三份数据拼接成一份，送到MLP compute_linear 中处理
+
+> compute_generic_gru 做什么？ ❌ ❌ ❌
+把state与新输入的数据做拼接
+zrh 把更新门，重置门，隐状态拼接保存到连续内存。实现与 GRU官方公式有区别，但是最终也实现了近乎相同的结果。
+
+💡 输入数据与zrh 权重进行计算
+💡 state数据与 recurrent 权重进行计算，recurrent 公式中隐状态的权重，而不是隐状态本身
+标准回答：
+`compute_generic_gru()` 分别对当前输入和上一时刻 hidden state 做线性变换。两组结果在 z/r 分支上进行相加，然后经过 sigmoid；candidate 分支将输入变换结果与经过 reset gate 调制的 recurrent contribution 相加，再经过 tanh，最后由 update gate 融合旧 state 和 candidate，得到新的 hidden state。
+
+> GRU 的 reset/update gate 是干什么的？
+
+> reset gate
+重置门，对历史信息作过滤，控制历史信息留存程度。
+
+> update gate
+更新门，计算本次隐状态，控制上一次隐状态与候选隐状态的留存比例。
+
+> candidate state
+候选状态，通过重置门得到，作为更新门的一个备选隐状态
+
+> new state
+H_new = z*(H_t-1) + (1-z)*(H_candidate)
+
+> state 为什么会导致误差传播？
+state 保存了历史数据，会一直向后传递
+
+> 为什么第一帧误差小，后面可能扩大？
+GRU中会保存部分历史数据，从而把历史每次误差一步步向后传递，从而误差会越来越大
+
+**两个卷积层，三个GRU层的配置，是通过多次生产试验得出的结果，而非通过代码可以完全解释**
+
+💡 Phase 1 学习过程中要建立的一个重要习惯：**能够解释架构的计算作用，不等于能够给每一层强行赋予人类语义。**
+
+
+**音频特征提取** 输入数据 65 原因
+
+`rnn_compute_frame_features()`
+    ｜
+`dct(features, Ly);`
+
+log-energy / spectral envelope features
+
+得到第一组 32 个特征，这里的 Ly 是每个频带的 log energy。RNNoise 用 32 个频带的 log-energy 描述当前声音频谱的强弱分布，并经过 DCT 压缩成 32 个特征。这些特征可以理解为频谱整体形状的一种紧凑表示。
+
+第二组 32 correlation / pitch-related features
+`dct(&features[NB_BANDS], Exp);`
+
+最后的 1 pitch period feature
+`features[2*NB_BANDS] = .01*(pitch_index-300);`
+
+1 标准的计算图应该是什么样的？给出一些中文权威计算图连接，我俩节的计算图，方形表示变量，圆形表示算子计算，和你给出的图似乎不一样。
+2 确认我的学习主路线，完整的路线中，音频知识是不是一个必须的拼图？之前的学习流程中，为什么学习安排中没有提到必须的音频知识？是因为通过我的工作经验，你假设这些知识我已经具备了吗？
+3 因为音频知识又安排了几天的学习时间，势必会造成delay。在后续的学习中，我如果再提出一些与现在学习路径不直接相关的问题，你是不是又会额外的安排时间让我学习，造成后面学习进度严重delay？
+
+
+log-energy 能量对数，对能量进行收敛（e.g x=1，10，100，1000） log（x）=1，2，3，4
+spectral envelope features： 频谱整体轮廓 特性
+
+原始频谱：
+
+ /\ /\    /\/\ /\
+/  V  \__/  \_/  \__
+
+整体轮廓：
+
+    ______
+ __/      \____
+
+correlation（相关性）： 两个声音有多像， 比如 啊～～～～  分成两段的话，就会很相似
+人类语音相关性比较强，噪声的相关性比较弱。
+
+pitch-related features
+
+pitch period feature
+
+32个 band gains
+
+频带插值到 FFT bins， 32 gains-> 32 band -> 480 bins， 必须要线性插值，尽量平滑，防止突变， 对每个频率 bin 进行缩放
+
+上面的三步骤后为什么就能实现音频降噪？
+
+增益：
+
+抑制系数： gain (0,1)， 保留原有能量的比例
+
+
+**Dense Out 在 RNNoise 里最重要的不是“它是一个 Linear 层”，而是它的 32 个输出对应了什么。**
+
+
+
+## TODO
+
+### 音频 DSP 基础知识 
+[/Users/chengmo/Work/rnnoise/doc/音频知识补充学习参考.md]
+
+### 误差分析 
+
+Experiment 1:
+C vs PyTorch，全部 FP32
+→ 观察基础误差
+
+Experiment 2:
+C sigmoid vs torch.sigmoid
+→ 隔离 activation 差异
+
+Experiment 3:
+C tanh vs torch.tanh
+→ 隔离 activation 差异
+
+Experiment 4:
+C high precision vs low precision
+→ 隔离 precision effect
+
+Experiment 5:
+固定 state = 0
+→ 判断单步计算误差
+
+Experiment 6:
+连续 frame
+→ 观察 state error propagation
+
+Experiment 7:
+逐层 error
+→ 找到误差第一次明显出现的位置
+
+
+然后结论不能写：“误差越来越大，因为 state。”
+
+而要写成：
+
+**误差首次在哪一层出现 → 在该层单独实验是否复现 → 更换 activation/precision/state 后是否消失 → 因此确定根因。**
+
+这才是完整的 numerical validation。
+
+
+我的问题：
+> 4组 pair wise max∆  实现文件 err_stats/err_all.py
+1. 每一项的计算方式是什么？ 举例说明conv1.out 1.490e-08 如何计算的
+我看了err_stat.py, err_all.py 代码，我的理解是：
+一次读取 conv1.out 一行数据，剪切保留数据部分，8 维，8个数字，对其进行排列。 16帧 x 8维
+py，c 部分都这么做，然后[abs(py[0]-c[0])...abs(py[127]-c[127])], 对这个list取 max，max值就是 表中的值conv1.out 1.490e-08，如果我理解错误，请指出。
+
+帧 8，分量 5
+  Py高 = -0.18364284932613373
+  C高  = -0.18364286422729492
+  |Δ|  = 1.490116119e-08
+  该值处 1 ulp = 1.490116e-08   →   |Δ| = 1 ulp
+
+
+Py高 = -0.18364284932613373， C高  = -0.18364286422729492 这两个值的完整出处是什么？我问原始出处，是从这个数字从头到尾的产生过程。从 input 开始，经过哪些层，经过谁和谁，什么样的计算或处理，最终成为了这个数字，全部流程。每一个环节的变量出处都要说明。
+
+
+
+2. Py高 vs C高组，值逐层增大，不仅是低精度组，高精度组增长，这个问题需要我分析原因。
+
+
+3. dense.gains / vad.out 反而变小（1.3e-05 / 1.9e-05，比 dense.in 的 1.1e-04 小一个量级）—— 最后一层是 sigmoid，它把输入压到 (0,1) 并压缩了误差，这个结论有事实根据吗？
+
+AI瞎扯淡，把报告里这部分都修改掉
+
+
+> 逐帧误差曲线：是"轨迹分叉"还是"每帧都在错"
+1. 我需要dense.in 每一帧的数据，而不是第0和第15帧，以此观察趋势，避免 15帧或者0帧发生跳变。 你是否已经检查过跳变情况？把跳变的检查过程写到报告中
+
+2. 这部分数据是使用C投喂py了吗？所以逐帧数据同源？
+3. 端到端是什么？以后请不要突然说出一个没有解释过并且不是通用的词汇。第一次提出这种词的时候，请附带说明
+
+重新整理误差分析报告，部分描述冗余，部分名词无解释，凭空编造。历史补全迹象明显。
+模型网络误差分析的标准方式是什么？评估文档中对比测试的项目是否科学？通过对比是否可以分析出有意义的结论？
+
+---
+
+验收阶段的误差分析实验应该如何设计？我需要关注什么？哪些是我必须亲自做的？哪些是可以让AI来做的
+
+我能想到的项目的变化项
+
+实现代码区别：python vs c
+精度：高 vs 低
+网络层： conv1 x2 输出向量， gru x3 state向量， dense out x1输出向量， vad x1输出值
+超参数，输入数据同源
+用例暂定16帧数据
+误差积累：以 c（官方实现）的输出作为每一层c和py的输入数据源，从而可以避免误差积累
+
+补充
+- 输入，超参数相同 ✅
+
+哪里可能引入误差？？
+
+- 矩阵乘法
+- rcp 
+- 底层浮点累加顺序、SIMD、FMA、编译器优化
+
+
+## Experiment A：单层隔离实验
+
+“逐层用 C 输出作为输入”方案
+
+**“这一层 Python 实现本身和 C 实现之间的误差”**
+
+多项式=C低精度
+torch.sigmoid/tanh=py高精度
+sigmoid/tanh_approx=py低精度
+
+最大绝对误差
+
+sigmoid C 高精度是基准， py 高精度 误差 1e-8， C低精度 1e-4， py 低精度 1e-5
+tanh C 高精度是基准， py 高精度 误差 1e-8， C低精度 1e-4， py 低精度 1e-5
+
+
+## Experiment B：真实端到端实验
+
+例如 16 帧：
+
+```text
+frame 0
+C:
+input → conv1 → conv2 → gru1 → gru2 → gru3 → dense → vad
+
+Py:
+input → conv1 → conv2 → gru1 → gru2 → gru3 → dense → vad
+```
+
+然后：
+
+```text
+Py frame 0
+Py frame 1
+Py frame 2
+...
+```
+
+全部使用 Python 自己上一帧的 state。
+
+C 也是：
+
+```text
+C frame 0
+C frame 1
+C frame 2
+...
+```
+
+然后比较：
+
+```text
+每帧每一层
+```
+
+这组实验回答：
+
+> 即使每一层独立误差都很小，经过 GRU recurrence 以后，最终会不会放大？
+
+这才是真正的“误差积累”。
+

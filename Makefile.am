@@ -1,6 +1,7 @@
 ACLOCAL_AMFLAGS = -I m4
 
-AM_CFLAGS = -march=native -O3 -I$(top_srcdir)/include -I$(top_srcdir)/src $(DEPS_CFLAGS)
+# 这里就算标记了 -O3， 会被后面 configure 中 gcc 编译FLAG 覆盖 -O2
+AM_CFLAGS = -march=native -I$(top_srcdir)/include -I$(top_srcdir)/src $(DEPS_CFLAGS)
 
 dist_doc_DATA = COPYING AUTHORS README
 

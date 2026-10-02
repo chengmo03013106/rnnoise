@@ -287,7 +287,13 @@ static int padding_rn( RNNoise * rn, float (*inputs)[CASE_CONV1_IN]) {
 
   /* 3. 逐层挂到 RNNoise 上（其它字段保持 NULL） */
   memset(rn, 0, sizeof(RNNoise));
-  memcpy(inputs, cc[0].inputs, CASE_NB_FRAMES * CASE_CONV1_IN*sizeof(float));
+  /* 逐行拷 conv1 的输入序列。
+   * 不能整块 memcpy：Conv1dCase.inputs 的声明是 [CASE_NB_FRAMES][CASE_CONV_MAX_IN]
+   * （行步长 = CASE_CONV2_IN = 8），而这里的目标是 [CASE_NB_FRAMES][CASE_CONV1_IN]
+   * （行步长 4）。整块按"步长 4"拷的话，每行的填充区（那 4 个没被写过的 float）会被
+   * 当成下一帧的数据，结果是输入序列错位、隔行变 0、且后 8 帧永远用不上。 */
+  for (int f = 0; f < CASE_NB_FRAMES; ++f)
+    memcpy(inputs[f], cc[0].inputs[f], CASE_CONV1_IN*sizeof(float));
   /* ---- conv1：每帧输入 4 -> 线性 12 -> 输出 8 ---- */
   rn->conv1.bias          = cc[0].bias;
   rn->conv1.float_weights = cc[0].float_weights;
@@ -362,10 +368,12 @@ static int conv_gru_unit(const char *case_path) {
 
   float conv1_state[CASE_CONV1_IN*3] = {0.0};
   float conv2_state[CASE_CONV1_OUT*3] = {0.0};
-  float gru1_state[GRU_STATE_SIZE] = {0.0};
-  float gru2_state[GRU_STATE_SIZE] = {0.0};
-  float gru3_state[GRU_STATE_SIZE] = {0.0};
-  float gains[32] = {0.0};
+  /* 隐状态长度 = CASE_GRU_N(24)，不是真实模型的 GRU_STATE_SIZE(384) ——
+   * compute_generic_gru() 只会写 N = recurrent->nb_inputs 个元素。 */
+  float gru1_state[CASE_GRU_N] = {0.0};
+  float gru2_state[CASE_GRU_N] = {0.0};
+  float gru3_state[CASE_GRU_N] = {0.0};
+  float gains[(CASE_GRU_IN*4)/(1536/32)] = {0.0};
   float vad[1] = {0.0};
 
   float tmp[MAX_RNN_NEURONS_ALL]={0.0};
@@ -377,23 +385,63 @@ static int conv_gru_unit(const char *case_path) {
 
     /*for (int i=0;i<INPUT_SIZE;i++) printf("%f ", input[i]);printf("\n");*/
     compute_generic_conv1d(&model->conv1, tmp, conv1_state, input, CASE_CONV1_IN, ACTIVATION_TANH, arch);
+    print_layer_item("conv1","out",i,tmp,CASE_CONV1_OUT);
     compute_generic_conv1d(&model->conv2, cat, conv2_state, tmp, CASE_CONV2_IN, ACTIVATION_TANH, arch);
+    print_layer_item("conv2","out",i,cat,CASE_CONV2_OUT);
     compute_generic_gru(&model->gru1_input, &model->gru1_recurrent, gru1_state, cat, arch);
+    print_layer_item("gru1","state",i,gru1_state,CASE_GRU_N);
     compute_generic_gru(&model->gru2_input, &model->gru2_recurrent, gru2_state, gru1_state, arch);
+    print_layer_item("gru2","state",i,gru2_state,CASE_GRU_N);
+
     compute_generic_gru(&model->gru3_input, &model->gru3_recurrent, gru3_state, gru2_state, arch);
+    print_layer_item("gru3","state",i,gru3_state,CASE_GRU_N);
+
     /* 三份隐状态各有 CASE_GRU_N 个数（= 24），不是 CASE_GRU_OUT(72)，更不是真实的 GRU1_OUT_SIZE(384) */
     RNN_COPY(&cat[CASE_CONV2_OUT], gru1_state, CASE_GRU_N);
     RNN_COPY(&cat[CASE_CONV2_OUT+CASE_GRU_N], gru2_state, CASE_GRU_N);
     RNN_COPY(&cat[CASE_CONV2_OUT+CASE_GRU_N+CASE_GRU_N], gru3_state, CASE_GRU_N);
 
-    #if 0 
+    print_layer_item("dense","in",i,cat,CASE_CONV2_OUT+CASE_GRU_N*3);
+
     compute_generic_dense(&model->dense_out, gains, cat, ACTIVATION_SIGMOID, arch);
+    print_layer_item("dense","gains", i, gains, sizeof(gains)/sizeof(float));
     compute_generic_dense(&model->vad_dense, vad, cat, ACTIVATION_SIGMOID, arch);
-    #endif
+    print_layer_item("vad","out", i, vad, sizeof(vad)/sizeof(float));
     
-    print_layer_item("gains", "gains", i+1, gains, sizeof(gains)/sizeof(float));
-    print_layer_item("vad", "vad", i+1, vad, sizeof(vad)/sizeof(float));
   }
+
+  return 0;
+}
+
+/* ===================== 单元: activation =====================
+ * 单算子微基准（micro-benchmark）：在一段固定网格上把 C 的 sigmoid / tanh 打出来。
+ *
+ * 为什么要单独做：整网里每一层的差都是「激活近似 + 线性累加 + 上游传播」揉在一起的，
+ * 没法回答"这个 1e-4 到底是谁贡献的"。把算子单独拎出来在一段网格上量一遍，
+ * 就得到一把**独立的刻度尺**（不受网络、不受递推污染）。
+ *
+ * 网格点也一并打印（act.x），Python 侧直接读它来算参考值 ——
+ * 这样两侧用的是**逐位相同**的输入，避免各自造网格造出假差异。
+ *
+ * 对应统计脚本：scripts/err_stats/bench_act.py
+ * 这个单元不吃用例文件。
+ */
+#define BENCH_N 1601
+static int activation_unit(const char *case_path) {
+  static float x[BENCH_N];
+  static float y[BENCH_N];
+  int i;
+
+  (void)case_path;
+  for (i = 0; i < BENCH_N; i++) x[i] = -8.0f + 0.01f * (float)i;
+
+  print_item("act.x", 0, x, BENCH_N);
+
+  compute_activation(y, x, BENCH_N, ACTIVATION_SIGMOID, 0);
+  print_item("act.sigmoid", 0, y, BENCH_N);
+
+  compute_activation(y, x, BENCH_N, ACTIVATION_TANH, 0);
+  print_item("act.tanh", 0, y, BENCH_N);
 
   return 0;
 }
@@ -427,6 +475,9 @@ static void usage(const char *argv0, const char *bad_unit) {
     "                all     整条链路 conv1 -> conv2 -> gru1 -> gru2 -> gru3\n"
     "                        参数分别取自 scripts/unit_cases/ 下的\n"
     "                        conv.json / gru.json / dense.json，所以它不收 case.json\n"
+    "                activation  单算子微基准：在 x = -8..+8（步长 0.01）的固定网格上\n"
+    "                        打 act.x / act.sigmoid / act.tanh，给误差归因当刻度尺\n"
+    "                        也不收 case.json（对应 scripts/err_stats/bench_act.py）\n"
     "  case.json   可选，显式指定用例文件；不写就按约定找\n"
     "              <仓库根>/scripts/unit_cases/<用例文件名>.json\n"
     "              （conv1d -> conv.json、gru -> gru.json）\n"
@@ -464,11 +515,14 @@ int main(int argc, char **argv) {
    * all 单元本来就对应不到单个 json，所以这里单独说明一下。 */
   fprintf(stderr, "[rnn_unit] case file: %s\n",
           case_path != NULL ? case_path
-                            : (strcmp(unit, "all") == 0 ? "(all 用三份用例，见下)" : "(未找到)"));
+                            : (strcmp(unit, "all") == 0 ? "(all 用三份用例，见下)"
+                               : (strcmp(unit, "activation") == 0 ? "(activation 不用用例)"
+                                                                  : "(未找到)")));
 
   if (!strcmp(unit, "conv1d"))   rc = conv1d_unit(case_path);
   else if (!strcmp(unit, "gru")) rc = gru_unit(case_path);
   else if (!strcmp(unit, "all")) rc = conv_gru_unit(case_path);
+  else if (!strcmp(unit, "activation")) rc = activation_unit(case_path);
   else {
     usage(argv0, unit);
     return 2;
@@ -476,7 +530,8 @@ int main(int argc, char **argv) {
 
   /* 只在"启动就错"的那一类（连用例文件都没找到）把完整用法打出来；
    * 数据类错误保持原样 —— 最后一行留真正的错误原因，别被用法盖掉。 */
-  if (rc != 0 && case_path == NULL && strcmp(unit, "all") != 0) {
+  if (rc != 0 && case_path == NULL
+      && strcmp(unit, "all") != 0 && strcmp(unit, "activation") != 0) {
     fprintf(stderr, "\n[rnn_unit] unit %s 启动失败：没找到用例文件，argv[2] 也没显式给。用法如下:\n",
             unit);
     usage(argv0, NULL);

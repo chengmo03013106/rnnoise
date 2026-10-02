@@ -38,7 +38,7 @@
 #include <stdio.h>
 
 
-#define INPUT_SIZE 42
+#define INPUT_SIZE 65
 
 
 void compute_rnn(const RNNoise *model, RNNState *rnn, float *gains, float *vad, const float *input, int arch) {
