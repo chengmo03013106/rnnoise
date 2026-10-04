@@ -706,8 +706,8 @@ RNNoise 正是音视频领域传统信号处理被神经网络替代的典型案
 ### 里程碑 1：用 PyTorch 重写 RNNoise 并导出 ONNX
 
 **完成内容**：
-- 理解 RNNoise 的 GRU 网络结构
-- 从 C 源码提取权重，用 PyTorch 重建模型
+- 理解 RNNoise 的 GRU 网络结构 ✅
+- 从 C 源码提取权重，用 PyTorch 重建模型 ✅
 - 导出 ONNX 文件，验证推理结果与原版一致
 
 **新增可投递岗位**：

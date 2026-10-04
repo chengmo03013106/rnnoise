@@ -96,25 +96,28 @@ def main(argv):
     print("    b[%d] = %+.10e          <- conv1.bias[%d]" % (idx, b, idx))
     print()
 
-    print("【出处 5】求 y[%d] 的两种算法（这就是那个 ulp 差的来源）" % idx)
-    s64 = math.fsum(terms) + b                                   # 高精度求和
-    s32 = 0.0
-    for t in terms:                                              # 顺序累加，每步舍入
-        s32 = f32(s32 + f32(t))
-    s32 = f32(s32 + b)
-    print("    float64 求和后舍入 = %.17g  -> float32 = %.10e" % (s64, f32(s64)))
-    print("    float32 顺序累加   = %.10e   （每一步都舍入）" % s32)
-    print("    C 的 sgemv 与 torch 的 matmul 用的是**不同的累加顺序**，")
-    print("    所以两边会落在相邻的 float32 上 —— 这就是下面那 1 ulp 的来源。")
+    print("【出处 5】求 y[%d]：两侧的算术不同 —— 这就是那 1 ULP 的来源" % idx)
+    # C 侧的真实算术（三条源码事实，都已读过）：
+    #   src/nnet_arch.h:140  compute_linear 里 float_weights 非空 → 调 sgemv
+    #   src/vec_avx.h:672    sgemv 的内层是 for (j...) vy = _mm256_fmadd_ps(vw, vxj, vy);
+    #                        → 对**单个输出通道**就是 j 串行、每步一次 **FMA（乘积不舍入）**
+    #                        （8 路并行是跨输出通道的，不影响单个通道的累加次序）
+    #   src/nnet_arch.h:151  bias 是在循环之后单独 `out[i] += bias[i]`
+    # Python 侧：torch.matmul 的内核不透明，只能从**落点**判断 ——
+    #            它等于"float64 求和后一次舍入"这个点（见【出处 7】的对照）。
+    acc = f32(0.0)
+    for j in range(len(tmp)):
+        acc = f32(float(acc) + float(W[j][idx]) * float(tmp[j]))
+    y_c = f32(acc + b)
+    y_py = f32(math.fsum(terms) + b)
+    print("    C  侧（FMA 串行）    y[%d] = %.10e   ← 模拟 src/vec_avx.h:672" % (idx, y_c))
+    print("    Py 侧（高精度求和）   y[%d] = %.10e   ← 等价于 torch.matmul 的落点" % (idx, y_py))
+    print("    两者相差 %.10e    → 落在相邻的 float32 上" % abs(y_c - y_py))
     print()
 
     print("【出处 6】激活 conv1.out[%d] = tanh(y[%d])" % (idx, idx))
-    for name, val in (("float64 精确 tanh 再舍入", f32(math.tanh(f32(s64)))),
-                      ("torch.tanh（Py 高精度用的）", f32(math.tanh(f32(s64)))),
-                      ("tanh_approx 多项式（低精度用的）", None)):
-        if val is None:
-            continue
-        print("    %-26s = %+.17g" % (name, val))
+    print("    C  侧 tanh(y_c)  = %+.17g" % f32(math.tanh(y_c)))
+    print("    Py 侧 tanh(y_py) = %+.17g" % f32(math.tanh(y_py)))
     print()
 
     print("【出处 7】与两侧实际打印值对照（%.8e 只有 9 位有效数字，先还原成 float32）")
@@ -125,13 +128,19 @@ def main(argv):
         c = ch[("conv1.out", frame)][idx]
         print("    Python 打印值 -> float32 : %.17g" % a)
         print("    C      打印值 -> float32 : %.17g" % c)
-        print("    两者之差                 : %.10e  (%.0f ulp)"
+        print("    两者之差                 : %.10e  (%.0f ULP)"
               % (abs(a - c), abs(a - c) / 2.0 ** (math.floor(math.log2(max(abs(a), abs(c)))) - 23)))
-        exact = f32(math.tanh(f32(s64)))
+        exact = f32(math.tanh(f32(math.fsum(terms) + b)))
         print("    float64 精确参考          : %.17g" % exact)
-        print("    → Python 与精确参考差 %.0f ulp；C 与精确参考差 %.0f ulp"
+        print("    → Python 与精确参考差 %.0f ULP；C 与精确参考差 %.0f ULP"
               % (abs(a - exact) / 2.0 ** (math.floor(math.log2(abs(a))) - 23),
                  abs(c - exact) / 2.0 ** (math.floor(math.log2(abs(c))) - 23)))
+        print()
+        print("    ★ 模拟能不能**精确复现**两侧？（这是判「算术对不对」的硬判据）")
+        print("      C  侧：tanh(FMA 串行)     = %.17g  %s"
+              % (f32(math.tanh(y_c)), "✓ 与 C 打印值一致" if f32(math.tanh(y_c)) == c else "✗ 不一致"))
+        print("      Py 侧：tanh(float64 求和) = %.17g  %s"
+              % (f32(math.tanh(y_py)), "✓ 与 Py 打印值一致" if f32(math.tanh(y_py)) == a else "✗ 不一致"))
     except FileNotFoundError as exc:
         print("    （缺少原始输出，先跑 collect_all.sh）：%s" % exc)
     print()

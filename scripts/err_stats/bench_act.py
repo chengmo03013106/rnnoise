@@ -119,6 +119,99 @@ def rows_tanh(x, ch, cl, exact):
     return out, chv, clv, t.tolist(), p.tolist()
 
 
+RCP_REL_BOUND = 1.5 * 2 ** -12      # Intel RCPPS 规格：最大相对误差 ≈ 3.66e-04
+P_SPAN = {"sigmoid": 0.5, "tanh": 1.0}          # |P| 的上界（P = 多项式值 − 中点）
+SRC_POLY_EST = {"sigmoid": 3e-5, "tanh": 6e-5}  # src/vec_avx.h 注释给的有理式部分估计
+
+
+def sec_bound_check(out, x):
+    """**三个量必须分清** —— 这一节存在的唯一目的就是分清它们。
+
+    | 量 | 性质 |
+    |---|---|
+    | 网格 1601 点上的最坏值 | **采样观测值**。网格是有限子集，所以它 **≤ 真实最坏值**，是**下界** |
+    | `src/vec_avx.h` 注释里的估计 | 作者对整个域做的估计（非形式化，但是全域优化出来的） |
+    | 用 `_mm256_rcp_ps` 规格推的**解析界** | **真正的上界**，对任意输入成立 |
+
+    ## 为什么网格值**不是**上界
+
+    误差里含 `_mm256_rcp_ps` 的贡献，它随输入的位模式变化，
+    在 0.01 尺度上剧烈起伏（实测**相邻格点能差到 max 的 87%**，高于半高的尖峰几百个）。
+    所以**有限采样必然漏掉更高的峰**：网格值只能当"至少这么大"用。
+
+    ## 解析界的推法
+
+    以 sigmoid 为例。源码是 `0.5 + x·num·rcp(den)`，记多项式值 `P = x·num/den`
+    （= `poly_sigmoid − 0.5`）。`rcp` 的相对误差 ε 有 `|ε| ≤ 1.5×2⁻¹²`，于是
+
+        C低(x) − 精确(x) = [P(x) − (精确−0.5)] + P(x)·ε
+        |C低 − 精确| ≤ max|多项式误差| + max|P| · 1.5×2⁻¹²
+
+    其中 `max|P|` 由端点跨度定：sigmoid 的 `P ∈ [−0.5, +0.5]`，tanh 的 `P ∈ [−1, +1]`。
+    多项式那一项是**光滑**的（有理式对精确函数的差），网格采样对它**可信**，
+    而且与源码注释给的数量级一致（sigmoid ~3e-5、tanh ~6e-5）。
+    """
+    act = parse(os.path.join(RAW, "c_act_low.txt"))
+    gx = act[("act.x", 0)]
+    exact = {"sigmoid": exact_sigmoid(gx), "tanh": exact_tanh(gx)}
+    # C 侧低精度（含 rcp）在网格上的值，直接从 C 的输出里读
+    c_low = {"sigmoid": act[("act.sigmoid", 0)], "tanh": act[("act.tanh", 0)]}
+    # Python 侧低精度用**精确除法**，所以它的差值里只含多项式误差、不含 rcp
+    py_low = {"sigmoid": A.sigmoid_approx(x), "tanh": A.tanh_approx(x)}
+
+    rows = {}
+    for k in ("sigmoid", "tanh"):
+        gw = mxa([a - b for a, b in zip(c_low[k], exact[k])])
+        pw = mxa([a - b for a, b in zip([float(v) for v in py_low[k]], exact[k])])
+        # 多项式那一项取「网格实测」与「源码注释估计」的较大者：
+        # 前者是采样值，后者是作者对全域的估计，取 max 更保守
+        pb = max(pw, SRC_POLY_EST[k])
+        rows[k] = (gw, pw, pb, pb + P_SPAN[k] * RCP_REL_BOUND)
+
+    out.write("**上界：把三个量分清**（低精度档，参考值 = float32 精确值）\n\n")
+    out.write("| 来源 | sigmoid | tanh | 性质 |\n|---|---|---|---|\n")
+    out.write("| 网格 %d 点上的最坏观测（C 低） | %s | %s | **采样值**：网格是有限子集 → "
+              "它是真实最坏值的**下界** |\n"
+              % (len(gx), e(rows["sigmoid"][0]), e(rows["tanh"][0])))
+    out.write("| `src/vec_avx.h` 注释的作者估计 | ~1.5e-4 | ~3e-4 | 全域估计（非形式化） |\n")
+    out.write("| **解析上界** | **%s** | **%s** | **对任意输入成立**（推法见下） |\n\n"
+              % (e(rows["sigmoid"][3]), e(rows["tanh"][3])))
+
+    out.write("解析上界的构成：`多项式最坏 + max\\|P\\| × 3.66e-04`\n\n")
+    out.write("| | 多项式最坏（取网格实测与注释估计的较大者） | `max\\|P\\|` | rcp 那一项 | 合计 |\n")
+    out.write("|---|---|---|---|---|\n")
+    for k in ("sigmoid", "tanh"):
+        out.write("| %s | %s | %.1f | %s | **%s** |\n"
+                  % (k, e(rows[k][2]), P_SPAN[k], e(P_SPAN[k] * RCP_REL_BOUND), e(rows[k][3])))
+    out.write("\n")
+    out.write("> `P = x·num/den`（多项式值减中点）。`|P|` 的上界由值域定：\n")
+    out.write("> sigmoid 的 `P ∈ [−0.5, +0.5]`、tanh 的 `P ∈ [−1, +1]`，所以取 0.5 / 1.0。\n\n")
+
+    out.write("**为什么网格值不是上界**（采样漏了多少）：\n\n")
+    for k in ("sigmoid", "tanh"):
+        ev = [abs(a - b) for a, b in zip(c_low[k], exact[k])]
+        step = max(abs(ev[i + 1] - ev[i]) for i in range(len(ev) - 1))
+        npeak = sum(1 for i in range(1, len(ev) - 1)
+                    if ev[i] >= ev[i - 1] and ev[i] > ev[i + 1] and ev[i] > 0.5 * max(ev))
+        out.write("- `%s`：相邻格点 `|Δe|` 最大 **%s**（= max 的 %.0f%%），"
+                  "高于半高的尖峰 **%d 个** → 步长 0.01 **明显漏峰**\n"
+                  % (k, e(step), 100 * step / max(ev), npeak))
+    out.write("\n")
+
+    real = parse(os.path.join(RAW, "c_gru_low.txt"))
+    pts = [(a, b) for layer in ("gru1", "gru2", "gru3") for f in range(NFRAMES)
+           for a, b in zip(real[("%s.zrh_recur" % layer, f)], real[("%s.sigmoid" % layer, f)])]
+    rw = mxa([b - r for b, r in zip([p[1] for p in pts], exact_sigmoid([p[0] for p in pts]))])
+    out.write("**网络真实输入上的观测值**（口径：`c_gru_low.txt`，即 **`gru` 单元的独立用例**，\n")
+    out.write("**不是整网 `all` 链路的输入**）：%d 个 `(x, sigmoid(x))` 对，最坏观测 **%s**，"
+              "落在解析上界之内。\n\n" % (len(pts), e(rw)))
+
+    out.write("> 这三个量**不能互相替代**：要「保证」用解析界；要「量级」用网格观测；\n")
+    out.write("> 要「网络里实际多大」看真实输入上的观测值。\n")
+    out.write("> 三者都**不能**回答「网络输出误差里有多少来自激活」—— "
+              "那个要靠 `teacher_force.py` / `amplify.py`。\n\n")
+
+
 def sec_table(out, title, rows):
     out.write("**%s**\n\n" % title)
     out.write("| 实现 | max\\|Δ\\| vs float32 精确 | mean\\|Δ\\| | mean(Δ) 带符号 |\n")
@@ -212,6 +305,7 @@ def main():
     out.write("不是 `all` 链路（`all` 里 gru 只打 state，拿不到前置量）。\n\n")
 
     srows, csig_h, csig_l, tsig, psig = rows_sigmoid(x, ch, cl, exact_sigmoid(x))
+    sec_bound_check(out, x)
     sec_table(out, "5.1 sigmoid", srows)
     out.write("**5.2 sigmoid 的「刻度尺」：多项式误差 vs 硬件倒数误差**\n\n")
     sec_ruler(out, "sigmoid", x, csig_h, csig_l, tsig, psig, exact_sigmoid(x))

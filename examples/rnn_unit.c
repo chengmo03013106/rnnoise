@@ -164,7 +164,7 @@ static void local_compute_generic_gru(const LinearLayer *input_weights,
 
   for (i=0;i<N;i++)
      h[i] = z[i]*state[i] + (1-z[i])*h[i];
-  print_layer_item(layer, "h", frame, h, N);
+  // print_layer_item(layer, "h", frame, h, N);
 
   for (i=0;i<N;i++)
      state[i] = h[i];
