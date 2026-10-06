@@ -18,7 +18,14 @@
       conv.json   conv1 / conv2 的参数（+ conv1 的输入序列）
       gru.json    gru1 / gru2 / gru3 的参数（+ gru1 的输入序列）
       dense.json  dense_out / vad_dense 的参数（整网输出层，没有输入序列）
-  「单元 -> 读哪几份」写在下面的 UNIT_CASES 里；整网 all 三份都要，路径全走默认。
+  「单元 -> 读哪几份」写在 examples/loader.py 的 UNIT_CASES 里；整网 all 三份都要，路径全走默认。
+
+本文件只留「单元的 runner + CLI」，其余的都拆出去只留一份：
+    examples/linear.py  Linear / DenseLayer / Conv1D + conv1d 单元
+    examples/gru.py     GRU 递推（do_rnnoise_gru_step / GRUScratch）
+    examples/utils.py   输出协议 emit() + 从用例取张量的 case_tensor()
+    examples/loader.py  用例加载（load_unit_cases / 规模常量 / CaseError）
+    （另：examples/linear.py 单独跑起来是个「线性层手工实验」，它不是单元，见那边的 USAGE）
 
 用法（本仓库用 uv 管理 python 环境）:
     uv run examples/rnn_unit.py conv1d                                # 自动找用例文件（= conv.json）
@@ -27,335 +34,29 @@
     uv run scripts/unit_check.py                                       # 通常用这个，会自动跑双方并对比
 """
 
-import json
 import os
 import sys
 
 import torch
-from torch import nn as nn
+
+# 显式重新导入这些名字，是为了保持既有接口不变（**不是**本地重复定义，定义体都在各自模块里）：
+# scripts/err_stats/*.py 按 `import rnn_unit as U` 用 U.Conv1D / U.DenseLayer / U.Linear /
+# U.GRUScratch / U.load_unit_cases —— 以后拆模块时别把这些名字断掉。
+# （tests/ 直接测 examples/gru.py，不再从这里取 get_gru_params。）
 from gru import GRUScratch as GRUScratch
-from rnnoise_activation import pick
+from linear import Conv1D, DenseLayer, Linear, conv1d_demo
+from rnnoise_scratch import RNNoiseMo as RNNoiseMo
+from utils import emit
 
-NB_FRAMES = 16          # 必须和 examples/rnn_unit.c 的 NB_FRAMES 一致
-
-# conv1d 单元要跑的两层：层名 + 每帧输入宽 + 输出宽。
-# 必须和 examples/rnn_unit.h 的 CASE_CONV1_IN / CASE_CONV1_OUT ... 一致
-# （那边宏名带 CASE_ 前缀，避免和 src/rnnoise_data.h 的真实模型尺寸撞名）。
-# 规模 = 真实模型尺寸 //16（conv1 是 65->128，conv2 是 128->384）。
-CONV_LAYERS = (
-    ("conv1", 4, 8),
-    ("conv2", 8, 24),
+from loader import (
+    CaseError,          # main() 靠它区分「文件不存在」和「内容不合格」
+    GRU_INPUT_SIZE,
+    GRU_LAYERS,
+    GRU_N,
+    GRU_OUTPUT_SIZE,
+    load_unit_cases,
 )
 
-# 注意：conv2 的 `inputs` 是可选的 —— 整网里它的每帧输入就是 conv1 的每帧输出，
-# 用例里没有这一项（缺了不算错误，只是这一层没有可独立跑的帧）。
-
-# gru 单元要跑的三层；三层真实规模相同（//16：每帧输入 384->24、N 384->24、门输出 3N 1152->72）。
-# 注意 gru 的每帧输入宽 = conv2 的输出宽，N 也等于它。
-GRU_LAYERS = ("gru1", "gru2", "gru3")
-GRU_N = 24                               # 隐层宽度 N（= 每帧输入宽 = conv2 输出宽）
-GRU_INPUT_SIZE = 24                      # 输入宽度
-GRU_OUTPUT_SIZE = 3 * GRU_N              # 三个门拼成的输出宽度 = 72
-
-# 整网输出层（对应 src/rnnoise_data.h 的 dense_out / vad_dense），参数在 dense.json 里。
-# 输入宽 = 整网拼接后的宽度 = conv2 输出 + 3 x gru 输出 = 24 + 72 = 96（真实 1536）。
-DENSE_IN_SIZE = 24 + 3 * GRU_N           # 96
-DENSE_LAYERS = (
-    ("dense_out", DENSE_IN_SIZE, 2),     # gains，真实 32 -> 2（//16）
-    ("vad_dense", DENSE_IN_SIZE, 1),     # VAD，单标量输出不再缩
-)
-
-def _is_num_list(value, n):
-    """是不是长度为 n 的**数字**数组。
-
-    只认真正的数字（int/float，且排除 bool），刻意不做 `float(x)` 转换：
-    C 侧那个极简解析器只认裸数字字面量，字符串 "1.5" 和 true/false 它都读不出来，
-    两边规则必须完全一致，否则会出现"py 读得进去、C 读不进去"的假差异。
-    """
-    return (isinstance(value, list) and len(value) == n
-            and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value))
-
-
-def _is_frames(value, width):
-    """是不是非空、帧数不超限、且每帧长度都对的多帧输入。"""
-    return (isinstance(value, list) and 0 < len(value) <= NB_FRAMES
-            and all(_is_num_list(f, width) for f in value))
-
-
-def _read_json(path):
-    """读用例 JSON。打不开或解析失败都算错误，直接退出（严格模式）。
-
-    对应 C 侧 open_case()：那边打错误信息 + 返回 -1，这边抛 SystemExit。
-    文件找不到属于"启动就错"，顺手把完整用法打出来。
-    """
-    if not path or not os.path.isfile(path):
-        usage(os.path.basename(sys.argv[0]) if sys.argv else "rnn_unit.py")
-        raise SystemExit("[rnn_unit.py] error: 没有用例文件 %s"
-                         "（scripts/unit_cases/<用例文件名>.json 不存在，也没在命令行上指定）"
-                         % (path,))
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError) as exc:
-        raise SystemExit("[rnn_unit.py] json error: 读取 %s 失败（%s）" % (path, exc))
-
-
-def _fail(msg):
-    """用例数据不合格：报错退出（对应 C 侧 load_*_case() 返回 -1）。"""
-    raise SystemExit("[rnn_unit.py] json error: %s" % msg)
-
-
-def _read_layer(data, layer):
-    """从用例里取出某一层的子对象。"""
-    sub = data.get(layer)
-    if not isinstance(sub, dict):
-        _fail("用例里没有 %s 这一层" % layer)
-    return sub
-
-
-def _need_num_list(sub, key, n, path):
-    """取 <path> 下长度必须正好是 n 的数字数组，不合格就报错退出。"""
-    value = sub.get(key)
-    got = len(value) if isinstance(value, list) else 0
-    if not _is_num_list(value, n):
-        _fail("字段 %s 缺失或长度不对（需要 %d，实际 %d）" % (path, n, got))
-    return list(value)
-
-
-def _need_frames(sub, key, width, path):
-    """取 <path> 下的多帧输入：1..NB_FRAMES 帧、每帧必须正好 width 个数。"""
-    value = sub.get(key)
-    if not _is_frames(value, width):
-        _fail("字段 %s 缺失、帧数为空/超上限，或某帧不是 %d 个数" % (path, width))
-    return [list(f) for f in value]
-
-
-def _load_conv1d_case(path):
-    """conv1d 用例：每层各自的 bias / float_weights（+ 只有 conv1 才有 inputs）。
-
-    规则必须和 examples/rnn_unit.c 的 load_conv1d_case() 完全一致，
-    否则两边会读到不同的数据，对比结果就是假的。返回 {层名: case}。
-    """
-    data = _read_json(path)
-    cases = {}
-    for layer, in_size, nb_out in CONV_LAYERS:
-        sub = _read_layer(data, layer)
-        n_w = 3 * in_size * nb_out
-        case = {
-            "layer": layer,
-            "nb_in": in_size,
-            "nb_out": nb_out,
-            "bias": _need_num_list(sub, "bias", nb_out, "%s.bias" % layer),
-            "float_weights": _need_num_list(sub, "float_weights", n_w,
-                                            "%s.float_weights" % layer),
-        }
-        # inputs 可选：conv2 在整网里由 conv1 的输出喂，用例里没有这一项，
-        # 那就当"没有可独立跑的帧"（不是错误）；有这一项但格式不对，仍然报错。
-        case["inputs"] = (_need_frames(sub, "inputs", in_size, "%s.inputs" % layer)
-                          if "inputs" in sub else [])
-        cases[layer] = case
-    return cases
-
-
-GRU_FIELDS = (
-    ("input_weights_float", GRU_INPUT_SIZE * GRU_OUTPUT_SIZE),
-    ("input_bias", GRU_OUTPUT_SIZE),
-    ("recurrent_weights_float", GRU_N * GRU_OUTPUT_SIZE),
-    ("recurrent_bias", GRU_OUTPUT_SIZE),
-    ("state", GRU_N),
-)
-
-
-def _load_gru_case(path):
-    """gru 用例：每层各自的 input_*/recurrent_* 四个矩阵 + state（+ 可选的 inputs）。
-
-    三层字段完全相同，所以共用一张字段表；规则必须和 examples/rnn_unit.c 的
-    load_gru_case() 完全一致。返回 {层名: case}。
-    """
-    data = _read_json(path)
-    cases = {}
-    for layer in GRU_LAYERS:
-        sub = _read_layer(data, layer)
-        case = {"layer": layer}
-        for field, n in GRU_FIELDS:
-            case[field] = _need_num_list(sub, field, n, "%s.%s" % (layer, field))
-        # inputs 可选：gru2 / gru3 在整网里由上一层的隐状态喂，用例里没有这一项，
-        # 那就当"这一层没有可独立跑的帧"（不是错误）；有这一项但格式不对，仍然报错。
-        case["inputs"] = (_need_frames(sub, "inputs", GRU_INPUT_SIZE, "%s.inputs" % layer)
-                          if "inputs" in sub else [])
-        cases[layer] = case
-    return cases
-
-
-def _load_dense_case(path):
-    """整网输出层用例（dense.json）：dense_out / vad_dense 各自的 bias + float_weights。
-
-    这两层没有记忆、也没有输入序列，所以用例里只有参数。
-    规则必须和 examples/rnn_unit.c 的 load_dense_case() 完全一致。返回 {层名: case}。
-    """
-    data = _read_json(path)
-    cases = {}
-    for layer, nb_in, nb_out in DENSE_LAYERS:
-        sub = _read_layer(data, layer)
-        cases[layer] = {
-            "layer": layer,
-            "nb_in": nb_in,
-            "nb_out": nb_out,
-            "bias": _need_num_list(sub, "bias", nb_out, "%s.bias" % layer),
-            "float_weights": _need_num_list(sub, "float_weights", nb_in * nb_out,
-                                            "%s.float_weights" % layer),
-        }
-    return cases
-
-
-# ===================== 用例文件：找 + 读 =====================
-
-# 逻辑名 -> 解析函数。每个函数只认自己那份文件的层级结构，
-# 字段名和长度必须和 examples/rnn_unit.c 的 load_<unit>_case() 一致。
-CASE_LOADERS = {
-    "conv": _load_conv1d_case,
-    "gru": _load_gru_case,
-    "dense": _load_dense_case,
-}
-
-# 单元 -> 读哪几份用例（逻辑名，顺序 = 读取顺序）。
-# 第一份是该单元「自己那份」，命令行 argv[2] 只能覆盖它；
-# 整网 all 另外要的 gru.json / dense.json 固定走默认路径。
-UNIT_CASES = {
-    "conv1d": ("conv",),
-    "linear": ("conv",),                     # 单层线性层的手工实验，借用 conv1 的参数
-    "gru":    ("gru",),
-    "all":    ("conv", "gru", "dense"),
-}
-
-
-def case_path(name):
-    """按约定定位用例文件：<仓库根>/scripts/unit_cases/<name>.json
-
-    必须和 examples/rnn_unit.c 的 auto_case_path() 找同一个文件。
-    """
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(root, "scripts", "unit_cases", "%s.json" % name)
-
-
-def load_unit_cases(unit, cli_path=None):
-    """读一个单元需要的全部用例，返回 (用到的文件列表, {层名: case})。
-
-    cli_path 就是命令行上的 argv[2]，只覆盖该单元「自己那份」用例；
-    其余几份一律走默认路径（用户要求：all 的路径默认，不用指定）。
-    读不到 / 字段不合格都会直接报错退出（严格模式）。
-    """
-    paths, cases = [], {}
-    for i, name in enumerate(UNIT_CASES[unit]):
-        path = cli_path if (i == 0 and cli_path) else case_path(name)
-        paths.append(path)
-        cases.update(CASE_LOADERS[name](path))
-    return paths, cases
-
-def emit(unit, output, frame, values, out=sys.stdout):
-    """按协议打印一项。格式化必须和 C 的 "%.8e" 一致。"""
-    out.write("[%s.%s#%d] %s\n" % (
-        unit, output, frame,
-        " ".join("%.8e" % float(v) for v in values),
-    ))
-
-class Linear(nn.Module):
-    def __init__(self,nb_input,nb_output,case):
-        super().__init__()
-        self.register_buffer(
-            'weights',
-            torch.tensor(case["float_weights"][:nb_input*nb_output], 
-                dtype=torch.float32).reshape(nb_input, nb_output)
-        )
-        # C 的权重布局是 weights[输入 j][输出 i]（sgemv 的 col_stride = nb_outputs）
-        # PyTorch 的 nn.Linear 是 [输出, 输入]，所以这里直接写 x @ w，不做转置
-        # 因为不需要训练，所以 requires_grad 不需要设置 True
-        assert self.weights.shape[0] == nb_input
-        self.register_buffer(
-            'bias',
-            torch.tensor(case["bias"][:nb_output], dtype=torch.float32)
-        )
-        assert len(self.bias.shape) == 1 and self.bias.shape[0] == nb_output
-
-    def forward(self, x):
-        x = x.reshape(-1, self.weights.shape[0])
-        y = x@self.weights + self.bias 
-        return y
-
-def linear_demo(cases, low_accuracy=False):
-    """单层线性层的手工实验：直接拿 conv1 那一层的参数跑一次。"""
-    layer, in_size, nb_out = CONV_LAYERS[0]
-    net = Linear(in_size, nb_out, cases[layer])
-    in_data = torch.tensor([1.0, 0.5, 0.5, 1.0])
-    out_data = net(in_data)
-    print(out_data)
-
-class DenseLayer():
-    def __init__(self,nb_input,nb_output,case,low_accuracy=True):
-        super().__init__()
-        self.linear = Linear(nb_input, nb_output, case)
-        # 高/低精度只换激活函数：low -> rnnoise_activation 的多项式，high -> torch.sigmoid
-        self.active = pick(low_accuracy)[0]
-
-    def __call__(self,data):
-        return self.active(self.linear(data))
-
-class Conv1D(nn.Module):
-    def __init__(self,nb_input,nb_output,case,input_size,low_accuracy=True):
-        # input_size * kernel_size = nb_inputs
-        super().__init__()
-        self.mem_size = nb_input - input_size
-        self.input_size = input_size
-        self.mem = torch.zeros(self.mem_size)
-        self.linear = Linear(nb_input, nb_output, case)
-        # 高/低精度只换激活函数：low -> rnnoise_activation 的 tanh 多项式，high -> torch.tanh
-        self.active = pick(low_accuracy)[1]
-
-    def forward(self, data):
-        assert data.numel() == self.input_size
-        total = torch.cat([self.mem, data], dim=0)
-        self.mem = total[self.input_size:].clone()
-        return self.active(self.linear(total))
-
-# ===================== 单元: conv1d =====================
-# 对应 src/nnet.c: compute_generic_conv1d()
-#   tmp = [mem, input] -> 线性层 -> 激活 -> 把 tmp 尾部存回 mem
-# 注意 src/nnet.c 里用的是 tanh_approx() 多项式近似 + 快速倒数，
-# 不是精确 tanh，所以两边只做数学等价对比，容差 1e-3。
-#
-# 同一份实现被 conv1 / conv2 两层复用，两层规模不同（见 CONV_LAYERS），
-# 所以这里按层循环：每层各自读用例、各自跑、各自打 [<层名>.out#帧] / [<层名>.mem#帧]。
-
-def conv1d_demo(cases, low_accuracy=True, out=sys.stdout):
-    # 激活也受 --acc 控制：low -> rnnoise_activation 的 tanh 多项式（= C 默认），
-    # high -> torch.tanh（= C 的 -DHIGH_ACCURACY）。
-    # 每层各自读用例、各自跑（conv2 在用例里没有 inputs，那一层就跳过了）。
-    for layer, in_size, nb_out in CONV_LAYERS:
-        case = cases[layer]
-        net = Conv1D(in_size * 3, nb_out, case, in_size, low_accuracy=low_accuracy)
-        for frame, raw in enumerate(case["inputs"]):
-            x = torch.tensor(raw, dtype=torch.float32)
-            out_data = net(x)
-            emit(layer, "out", frame, out_data[0], out)
-            # forward 里 mem 已经更新成 tmp 的尾部，和 C 的 RNN_COPY 一致
-            emit(layer, "mem", frame, net.mem, out)
-
-
-def get_gru_params(input_features_size, hidden_size, output_features_size):
-    
-    W_xh = torch.randn((input_features_size, hidden_size), dtype=torch.float32)
-    W_hh = torch.randn((hidden_size, hidden_size), dtype=torch.float32)
-    b_h = torch.zeros(hidden_size, dtype=torch.float32)
-
-    W_xz = torch.randn((input_features_size, hidden_size), dtype=torch.float32)
-    W_hz = torch.randn((hidden_size, hidden_size), dtype=torch.float32)
-    b_z = torch.zeros(hidden_size, dtype=torch.float32)
-    
-    W_xr = torch.randn((input_features_size, hidden_size), dtype=torch.float32)
-    W_hr = torch.randn((hidden_size, hidden_size), dtype=torch.float32)
-    b_r = torch.zeros(hidden_size, dtype=torch.float32)
-
-    return W_xh, W_hh, b_h, W_xz, W_hz, b_z, W_xr, W_hr, b_r
 
 def gru_demo(cases, low_accuracy=True, out=sys.stdout):
     '''对比 RNNoise 里 C 实现和 PyTorch 实现的输出。
@@ -385,7 +86,9 @@ def gru_demo(cases, low_accuracy=True, out=sys.stdout):
     for layer in GRU_LAYERS:
         case = cases[layer]
         if layer != GRU_LAYERS[0] and case["inputs"]:
-            _fail("字段 %s.inputs 不该出现（输入序列统一用 %s 那份）" % (layer, GRU_LAYERS[0]))
+            # 消息与 C 侧 gru_unit() 的那条校验保持一致（examples/rnn_unit.c:196）
+            raise CaseError("[rnn_unit.py] json error: 字段 %s.inputs 不该出现"
+                            "（输入序列统一用 %s 那份）" % (layer, GRU_LAYERS[0]))
         # 每层新建一个实例：隐状态从 0 开始（C 侧 gru_unit() 也是每层 memset 一次），
         # 不用用例 json 里的 state —— 两侧从同一起点递推，每次运行的起点也一样。
         net = GRUScratch(input_features_size, hidden_size, output_features_size,
@@ -395,9 +98,13 @@ def gru_demo(cases, low_accuracy=True, out=sys.stdout):
             net(x, low_accuracy=low_accuracy, out=out, frame=frame)
 
 
-import pdb
 def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
+    """整条链路（all 单元）—— **内联实现**，留作迁移对照的基准。
 
+    模型结构（7 层怎么搭）和逐帧数据流将来都归 examples/rnnoise_scratch.py 的
+    RNNoiseMo（见本文件下面的 rnnoise_demo_2），这里先原样保留一份，
+    用来验证两者执行结果**逐字节相同**。验完就可以把它连同 UNITS 里的 "all" 一起删掉。
+    """
     # 初始化
     input_features = cases['conv1']['nb_in']
     nb_out = cases['conv1']['nb_out']
@@ -414,10 +121,10 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
 
     gru1 = GRUScratch(gru_input_size, hidden_size, gru_out_size,
                     gru1_case, layer=gru1_case['layer'], detail=False)
-    
+
     gru2 = GRUScratch(gru_input_size, hidden_size, gru_out_size,
                     cases['gru2'], layer=cases['gru2']['layer'], detail=False)
-    
+
     gru3 = GRUScratch(gru_input_size, hidden_size, gru_out_size,
                     cases['gru3'], layer=cases['gru3']['layer'], detail=False)
 
@@ -433,13 +140,13 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
 
     for frame, data in enumerate(inputs_data):
         conv1_output = conv1(data)
-        
+
         print(f'conv1 {frame}:{conv1_output}')
         emit('conv1', "out", frame, conv1_output[0], out)
-        
+
         conv2_output = conv2(conv1_output.flatten())
         emit('conv2', "out", frame, conv2_output[0], out)
-        
+
         gru1_state = gru1(conv2_output.flatten(), low_accuracy=low_accuracy, out=out, frame=frame)
 
         gru2_state = gru2(gru1_state, low_accuracy=low_accuracy, out=out, frame=frame)
@@ -458,11 +165,31 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
         emit('vad', "out", frame, vad[0], out)
 
 
+def rnnoise_demo_2(cases, low_accuracy=True, out=sys.stdout):
+    """整条链路（all2 单元）—— 走 examples/rnnoise_scratch.py 的 RNNoiseMo。
+
+    和 rnnoise_demo() 的唯一区别：层怎么搭、每帧怎么串，都在类里；
+    这里只负责把用例里的输入读成张量、按帧驱动。
+
+    两者输出必须**逐字节相同**：`./rnn_unit all` vs `./rnn_unit all2`
+    （或 `uv run examples/rnn_unit.py all` vs `... all2`）。
+    """
+    rnn = RNNoiseMo(cases, low_accuracy=low_accuracy, out=out)
+
+    inputs_data = torch.tensor(cases['conv1']['inputs'], dtype=torch.float32)
+    assert inputs_data.shape[1] == 4
+
+    for frame, data in enumerate(inputs_data):
+        rnn.forward(frame, data)
+
+
+# 只放**真单元**（有 C 侧对手、打协议行、unit_check.py 会跑）。
+# linear_demo 那个线性层手工实验不在其列 —— 入口在 examples/linear.py。
 UNITS = {
     "conv1d": conv1d_demo,
-    "linear": linear_demo,
     "gru": gru_demo,
-    "all": rnnoise_demo,
+    "all": rnnoise_demo,        # 内联实现（对照基准）
+    "all2": rnnoise_demo_2,     # 走 RNNoiseMo 类（迁移目标）
 }
 
 ACC_LOW = "low"
@@ -505,8 +232,12 @@ USAGE = """\
                 conv1d  conv1 / conv2 两层各自独立跑，打 [convN.out#帧] / [convN.mem#帧]
                         （conv2 在用例里没有 inputs，那一层跑 0 帧）
                 gru     gru1 / gru2 / gru3 三层，打 [gruN.zrh_recur|sigmoid|recur_tanh|h|state#帧]
-                linear  单层线性层的手工实验（不算用例）
-                注意：整条链路的 all 单元目前只有 C 侧有（examples/rnn_unit.c 的 conv_gru_unit）
+                all     整条链路 conv1 / conv2 / gru1..3 / dense_out / vad_dense，
+                        打 [convN.out|gruN.state|dense.in|dense.gains|vad.out#帧]
+                        （内联实现，留作对照基准）
+                all2    同 all，但走 examples/rnnoise_scratch.py 的 RNNoiseMo 类
+                        （迁移对照：两者输出逐字节相同；验完可把 all 换成 all2）
+  （线性层的手工实验不是单元，不在 UNITS 里 —— 入口：uv run examples/linear.py）
   case.json   可选，显式指定用例文件；不写就按约定找
               <仓库根>/scripts/unit_cases/<用例文件名>.json（conv1d -> conv.json、gru -> gru.json）
   --acc       激活函数用高精度还是低精度（缺省 low，和 C 侧默认对齐）
@@ -520,7 +251,6 @@ USAGE = """\
 
 和 C 逐项对比: uv run scripts/unit_check.py [unit...]
 """
-
 
 def usage(prog, bad_unit=None, out=sys.stderr):
     """打完整用法。bad_unit 非 None 表示是"单元名不认识"这一类错误。"""
@@ -543,10 +273,17 @@ def main(argv):
         usage(prog, unit)
         return 2
 
-    # argv[2] 只覆盖该单元「自己那份」用例（见上面的 UNIT_CASES）；
+    # argv[2] 只覆盖该单元「自己那份」用例（见 loader.py 里的 UNIT_CASES）；
     # 其余几份固定走默认路径，所以 all 不用在命令行指定路径。
-    # 用例找不到 / 字段不合格都在 loader 里报错退出（严格模式），这里不用再判断。
-    paths, cases = load_unit_cases(unit, argv[2] if len(argv) > 2 else None)
+    # 用例找不到 / 字段不合格都由 loader 抛 CaseError（严格模式）。
+    try:
+        paths, cases = load_unit_cases(unit, argv[2] if len(argv) > 2 else None)
+    except CaseError as exc:
+        # 只有"用例文件不存在"才补打完整用法 —— 加载器不知道本程序的用法长什么样。
+        # 内容不合格时错误信息本身就是全部原因，打用法反而会把原因盖掉。
+        if exc.missing:
+            usage(prog)
+        raise
 
     # 打一行用例来源，驱动器拿它核对两侧读的是不是同一份文件
     print("[rnn_unit.py] case file: %s" % " ".join(paths), file=sys.stderr)

@@ -15,7 +15,7 @@
     2. 滑动窗口    conv1 的 mem 保留最近 2 帧的输入；
                    帧 f 时  mem = [x_{f-2}, x_{f-1}]（f<2 时缺的位置补 0）
     3. 拼接        tmp = [mem(8) , x_f(4)] = 12 个数 = [x_{f-2}, x_{f-1}, x_f]
-                   代码：C  `src/nnet.c:119-120`；Python `examples/rnn_unit.py: Conv1D.forward`
+                   代码：C  `src/nnet.c:119-120`；Python `examples/linear.py: Conv1D.forward`
     4. 线性        y = tmp @ W + b          W、b 来自 conv.json -> conv1.float_weights / bias
                    布局：float_weights[输入 j][输出 i]，12 行 × 8 列
                    代码：C  `src/nnet.c:121` -> `compute_linear`（float_weights 非空时走 sgemv）
@@ -23,7 +23,8 @@
     5. 激活        conv1.out = tanh(y)      代码：C `src/nnet.c:122`（ACTIVATION_TANH）
                                                    Python `torch.tanh` / `rnnoise_activation.tanh_approx`
     6. 打印        C  `examples/rnn_unit.c` -> `print_item("conv1.out", f, out, 8)`，格式 `%.8e`
-                   Python `examples/rnn_unit.py -> emit('conv1', "out", f, out)`，同一个格式
+                   Python `examples/utils.py: emit('conv1', "out", f, v, out)`，同一个格式
+                   （emit() 的唯一实现处；调用点在 examples/rnn_unit.py: rnnoise_demo()）
 
 用法：
     uv run python scripts/err_stats/trace_value.py [帧] [分量]
