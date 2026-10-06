@@ -27,3 +27,36 @@ rnnoise_data*
 Makefile
 Makefile.in
 *.pc
+
+# --- autotools / libtool 生成物 ---
+config.h
+stamp-h1
+conf[0-9]*
+configure~
+*.la
+*.tmp
+install-sh
+missing
+libtool
+ltmain.sh
+
+# --- 编译出的可执行文件 ---
+dump_features
+dump_rnn_io
+dump_weights_blob
+rnn_unit
+examples/rnnoise_demo
+
+# --- 运行/训练/实验产物 ---
+*.pth
+*.log
+*.f32
+examples/*.onnx
+
+# --- 大数据 / 模型权重 ---
+assets/*.sw
+assets/*.pcm
+
+# --- Python ---
+.pytest_cache/
+.coverage
