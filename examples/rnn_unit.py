@@ -107,22 +107,23 @@ def gru_demo(cases, low_accuracy=True, out=sys.stdout):
         # 隐状态由调用方持有（forward(x, hidden)）：每层各自一份、从 0 开始，
         # 逐帧把上一次返回的新隐状态接回去。
         hidden = torch.zeros(hidden_size, dtype=torch.float32)
-        # 本单元要打的 5 项，顺序 = C 的 local_compute_generic_gru() 的打印顺序
-        detail_items = ("zrh_recur", "sigmoid", "recur_tanh", "h", "state")
-        # GRUMo 一次只吃一帧，整段序列自己按帧循环（和 C 的 gru_unit() 同一个结构）
+        # GRUMo 一次只吃一帧，整段序列自己按帧循环（和 C 的 gru_unit() 同一个结构）。
+        # 只打唯一能拿到的那一项：新隐状态（GRUMo 不再返回中间量 detail）。
         for frame, x in enumerate(inputs_data):
-            # forward 返回 (新隐状态, 中间量 dict)；中间量随返回值出来，本类不打印也不存 self
-            hidden, detail = net(x, hidden)
-            for item in detail_items:
-                emit(layer, item, frame, detail[item], out)
+            hidden = net(x, hidden)
+            emit(layer, "state", frame, hidden, out)
 
 
 def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
     """整条链路（all 单元）—— **内联实现**，留作迁移对照的基准。
 
     模型结构（7 层怎么搭）和逐帧数据流将来都归 examples/rnnoise_scratch.py 的
-    RNNoiseMo（见本文件下面的 rnnoise_demo_2），这里先原样保留一份，
-    用来验证两者执行结果**逐字节相同**。验完就可以把它连同 UNITS 里的 "all" 一起删掉。
+    RNNoiseMo（见本文件下面的 rnnoise_demo_2），这里先原样保留一份作为对照。
+
+    注意：RNNoiseMo 的状态已改成显式进出，`all2` 不再返回 convN.out / dense.in，
+    所以这里多打的 [conv1.out|conv2.out|dense.in#帧] **只有 all 有** ——
+    两者只能在共有的 5 项（gruN.state / dense.gains / vad.out）上逐字节对比。
+    要跟 C 的 `all` 整网对齐 8 项，就用这个内联版。
     """
     # 初始化
     input_features = cases['conv1']['nb_in']
@@ -177,14 +178,14 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
         conv2_output, conv2_mem = conv2(conv1_output.flatten(), conv2_mem)
         emit('conv2', "out", frame, conv2_output[0], out)
 
-        gru1_state, _ = gru1(conv2_output.flatten(), gru1_state)
+        gru1_state = gru1(conv2_output.flatten(), gru1_state)
         # gruN.state 现在由这里打（GRUMo 不再自己打印）
         emit('gru1', "state", frame, gru1_state, out)
 
-        gru2_state, _ = gru2(gru1_state, gru2_state)
+        gru2_state = gru2(gru1_state, gru2_state)
         emit('gru2', "state", frame, gru2_state, out)
 
-        gru3_state, _ = gru3(gru2_state, gru3_state)
+        gru3_state = gru3(gru2_state, gru3_state)
         emit('gru3', "state", frame, gru3_state, out)
         dense_in = torch.cat((conv2_output.flatten(), gru1_state.flatten(), gru2_state.flatten(), gru3_state.flatten()), dim=0)
         # 拼给 dense / vad 的输入（对应 C 的 [dense.in#帧]）
@@ -202,11 +203,19 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
 def rnnoise_demo_2(cases, low_accuracy=True, out=sys.stdout):
     """整条链路（all2 单元）—— 走 examples/rnnoise_scratch.py 的 RNNoiseMo。
 
-    和 rnnoise_demo() 的唯一区别：层怎么搭、每帧怎么串，都在类里；
-    这里只负责把用例里的输入读成张量、按帧驱动。
+    和 rnnoise_demo() 的区别：
+      · 层怎么搭、每帧怎么串，都在类里；
+      · 状态（两块 conv mem + 三层 GRU hidden）**打包成一个 `state` 显式进出**：
+        `state = rnn.init_state()` 取初值，每帧 `state, (gains, vad) = rnn.forward(data, state)`；
+        类里只留全 0 初值（register_buffer）。
+      · 帧号 `frame` 留在**这里的循环**（`enumerate`），不进 `RNNoiseMo.forward` ——
+        它是只用于日志的 int，`torch.onnx.export` 不能把它当 graph input。
 
-    两者输出必须**逐字节相同**：`./rnn_unit all` vs `./rnn_unit all2`
-    （或 `uv run examples/rnn_unit.py all` vs `... all2`）。
+    因此 all2 只打类**返回值里有的** 5 项：
+        [gruN.state#帧] / [dense.gains#帧] / [vad.out#帧]
+    （conv1.out / conv2.out / dense.in 只在**内联版 `all`** 里打 —— 那三个是调试量，
+      RNNoiseMo 已不再返回，要跟 C 对齐就用 `all`；
+      `all2` 与 `all` 在共有的 5 项上必须**逐字节相同**。）
     """
     # 模型不打印（RNNoiseMo / GRUMo 都不打）：协议行在这里按 forward 的返回值统一打，
     # 顺序与 C 的 conv_gru_unit() 一致。
@@ -215,19 +224,18 @@ def rnnoise_demo_2(cases, low_accuracy=True, out=sys.stdout):
     inputs_data = torch.tensor(cases['conv1']['inputs'], dtype=torch.float32)
     assert inputs_data.shape[1] == 4
 
+    # 初值 = init_state()（buffer 的 clone）；之后每帧拿返回值覆盖，写法完全同形。
+    state = rnn.init_state()
+
     for frame, data in enumerate(inputs_data):
-        (conv1_output, conv2_output, gru1_state, gru2_state, gru3_state,
-         dense_in, gains, vad) = rnn.forward(frame, data)
+        state, (gains, vad) = rnn.forward(data, state)
+        # state 顺序 = (conv1_mem, conv2_mem, gru1_state, gru2_state, gru3_state)；
+        # 本单元只打 gru 的三个状态 + 两个输出，两块 conv mem 用不上。
+        _, _, gru1_state, gru2_state, gru3_state = state
 
-        # 这行是调试遗留（内联版 rnnoise_demo 里也有），为了两边逐字节可比先保留
-        print(f'conv1 {frame}:{conv1_output}')
-
-        emit('conv1', "out", frame, conv1_output[0], out)
-        emit('conv2', "out", frame, conv2_output[0], out)
         emit('gru1', "state", frame, gru1_state, out)
         emit('gru2', "state", frame, gru2_state, out)
         emit('gru3', "state", frame, gru3_state, out)
-        emit('dense', "in", frame, dense_in, out)
         emit('dense', "gains", frame, gains[0], out)
         emit('vad', "out", frame, vad[0], out)
 
@@ -280,12 +288,18 @@ USAGE = """\
   unit        要跑的单元（缺省 conv1d）:
                 conv1d  conv1 / conv2 两层各自独立跑，打 [convN.out#帧] / [convN.mem#帧]
                         （conv2 在用例里没有 inputs，那一层跑 0 帧）
-                gru     gru1 / gru2 / gru3 三层，打 [gruN.zrh_recur|sigmoid|recur_tanh|h|state#帧]
+                gru     gru1 / gru2 / gru3 三层，只打 [gruN.state#帧]
+                        （GRUMo.forward 只返回新隐状态、不再返回中间量 detail，
+                          所以 zrh_recur/sigmoid/recur_tanh/h 这 4 项目前没有 py 来源，
+                          unit_check 会把它们报成「仅 C 有，py 缺」）
                 all     整条链路 conv1 / conv2 / gru1..3 / dense_out / vad_dense，
                         打 [convN.out|gruN.state|dense.in|dense.gains|vad.out#帧]
                         （内联实现，留作对照基准）
                 all2    同 all，但走 examples/rnnoise_scratch.py 的 RNNoiseMo 类
-                        （迁移对照：两者输出逐字节相同；验完可把 all 换成 all2）
+                        状态（conv mem + 三层 hidden）显式进出，所以类只返回
+                        [gruN.state|dense.gains|vad.out#帧] 5 项 —— 比 all 少
+                        convN.out / dense.in（那三个是调试量）；
+                        与 all 在共有的 5 项上输出逐字节相同
   （线性层的手工实验不是单元，不在 UNITS 里 —— 入口：uv run examples/linear.py）
   case.json   可选，显式指定用例文件；不写就按约定找
               <仓库根>/scripts/unit_cases/<用例文件名>.json（conv1d -> conv.json、gru -> gru.json）

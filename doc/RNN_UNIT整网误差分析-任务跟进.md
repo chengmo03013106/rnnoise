@@ -108,11 +108,11 @@ dense_out / vad_dense  输入 96 → 2 / 1     （dense.json 只有参数）
 
 **这一步顺手修的两个"外部改动/历史遗留"（都先报备）**：
 
-1. **`from torch import nn` 被删掉了**（git 里还在，工作区没了）→
-   `gru.py:get_gru_params_from_net(net: nn.GRUCell)` 的**函数注解在 import 时就求值**，
-   于是整个模块 import 失败、`unit_check` 从 272 项掉到 **0 项通过**。
-   **这是在我动手之前就坏的**（外部编辑导致），已恢复该 import。
-   → 教训：**Python 的类型注解也是运行时求值的**，`nn` 没导入连模块都加载不了。
+1. **`from torch import nn` 被删掉了**（git 里还在，工作区没了）→ 模块 import 失败、
+   `unit_check` 从 272 项掉到 **0 项通过**（当时是函数注解 `net: nn.GRUCell` 在 import 时求值触发；
+   现在 `nn` 仍是 `GRUMo` 的基类 `nn.Module` 所必需）。**这是在我动手之前就坏的**（外部编辑导致），
+   已恢复该 import。
+   → 教训：**Python 的类型注解、基类都是运行时求值的**，`nn` 没导入连模块都加载不了。
 2. `gru_demo()` 原来是坏的：`net(inputs_data, hidden_0, gru)` 里 `gru` 未定义；
    而且它按"教材版 9 组参数 + 批量"写，与现在 `GRUMo`（RNNoise 的 [z|r|h] 布局、
    **一次一帧**）根本不兼容 —— 即使补上 `gru` 也会 `ValueError: too many values to unpack`。
@@ -143,9 +143,16 @@ dense_out / vad_dense  输入 96 → 2 / 1     （dense.json 只有参数）
 - [x] Python 侧命名对齐：`gains.out` → `dense.gains`；新增 `dense.in`；`vad` 改用 `vad[0]`
       （原来错用了 `gains[0]`）
 - [x] 按 Q2 决定：`all` 链路**不**补 gru 内部量。
-      ★ **2026-10-08 起演进**：曾用 `detail` 开关控制打几项，现已彻底简化 ——
-      `gru.py` **不打印任何协议行**：中间量由 `GRUMo.forward()` 随返回值一起给出
-      （`h_out, detail = net(x, h_in)`），打哪几项由调用方决定（`rnn_unit.py: gru_demo()`）。
+      ★ **2026-10-08 起演进 / 2026-10-09 定稿**：`gru.py` **不打印任何协议行**；
+      `GRUMo.forward()` **只返回新隐状态**（`h_out = net(x, h_in)`），
+      **不再返回中间量**（`detail` 既不返回、也不存 `self`；需求：detail 暂时不用）。
+      ⚠️ 代价：`gru` 单元原本要打的 5 项里只剩 `[gruN.state#帧]` 有 py 来源 ——
+      `examples/rnn_unit.py: gru_demo()` 已按此改好（不再报 `too many values to unpack`），
+      实测 `uv run scripts/unit_check.py gru`：**通过 48 项 / 失败 192 项**
+      （192 项全部是 C 独有的 `zrh_recur` / `sigmoid` / `recur_tanh` / `h`，
+      报「仅 C 有，py 缺」）。
+      要恢复 5 项逐项对齐：`GRUMo.forward()` 末尾 `return h` 改回 `return h, detail`，
+      `gru_demo()` 再按 detail 的键名回填那 4 项。
       原因：trace / `torch.onnx.export` 的图里不能混进 Python 打印这种副作用。
 - [x] `rnnoise_demo()` 去掉帧循环末尾的 `break`（原来只跑第 0 帧）—— 这是你授权的"最小必要三处"之一
 - ✓ 验收：两侧都是 **128 个 key**，**键集完全相同**（`set(c) == set(py)` 为 True），

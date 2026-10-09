@@ -21,6 +21,25 @@
 - 学习资料优先级：**官方文档 > 源码 > 自己实验 > 视频**（视频仅用于连续看文档仍形不成直觉时）
 - 进度不看百分比，看**验收项**：每一项都要"我能解释 + 我写过 + 我验证过 + 我能排错"
 
+### 环境约定（常驻）
+- 运行方式：`uv run python`（uv 0.12.1）→ **Python 3.12.13**；venv 在 **`/Users/chengmo/Work/.venv`**（在 workspace 之外，项目内没有 `pyproject.toml`，`.python-version` = `3.12`）。
+- **ONNX export 只走 legacy**：torch 2.2.2 的 `torch.onnx.export()` 签名里**没有 `dynamo` 参数**（`dynamo=` 是更高版本才并入该 API 的）；dynamo 是独立实验性 API `torch.onnx.dynamo_export()`，依赖 `onnxscript`（本环境未装）。讨论 export 时**只按 legacy 语义讲，不要把 dynamo 与 legacy 两种情况混在一起讨论或对比**。
+- 依赖版本（2026-10-09 实测，venv 内）：
+
+| 组件 | 版本 | 用途 |
+| --- | --- | --- |
+| torch | 2.2.2 | 建模 / export |
+| torchvision | 0.17.2 | torch 附带 |
+| onnx | 1.23.1 | ONNX 模型读写 |
+| onnxruntime | 1.23.2 | CPU EP 推理 + `onnxruntime.quantization`（INT8） |
+| numpy | 1.26.4 | 数据 |
+| protobuf | 7.36.2 | onnx 依赖 |
+| uv | 0.12.1 | 运行 / 环境管理 |
+
+- **未安装**（需要时再装，别默认可用）：`onnxscript`（只有 `dynamo_export` 需要）、`pytest`（`tests/` 用到）、`scipy` / `tqdm` / `keras` / `h5py`（只被旧脚本 `src/rnn_train.py`、`scripts/sweep.py`、`torch/rnnoise/train_rnnoise.py` 用到，当前学习链路不需要）。
+- ORT 可用 EP：`CPU / CoreML / Azure`，本项目只用 **CPU EP**。
+- 项目根的 `torch/` 目录（sparsification / weight-exchange）**不会遮蔽** venv 里的 torch（无 `__init__.py`，常规包优先级更高）：实测 `torch.__file__` 指向 `/Users/chengmo/Work/.venv/.../site-packages/torch/__init__.py`。
+
 ### 项目任务
 原始三任务（重建网络/导出 ONNX → ORT CPU 推理对比 → INT8 量化）是顺序依赖的，详细定义与当前进度见 `TASKS.md`。
 

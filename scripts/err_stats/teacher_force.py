@@ -112,7 +112,7 @@ def run_teacher_forced(cases, cdata, low_accuracy):
             # 隐状态由调用方持有（GRUMo 的 forward(x, hidden)）：这里把 C 的 state 当入参喂进去
             h_in = (torch.zeros(g_h, dtype=torch.float32) if f == 0
                     else cvec("gru%d.state" % (k + 1), f - 1))
-            h, _ = g(x, h_in)
+            h = g(x, h_in)
             out["gru%d.state" % (k + 1)].append(h)
 
         # dense / vad：喂 C 的 dense.in#f

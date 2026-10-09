@@ -3,7 +3,7 @@
 """GRU 单元测试。
 
 被测对象：`examples/gru.py`
-    get_gru_params / get_gru_params_from_net / do_gru / GRUMo
+    get_gru_params / do_gru / GRUMo
 
 （2026-10-06 起 GRU 的实现全都在 examples/gru.py 了。这些用例以前 import 的是
  `examples/rnn_unit.py` 和里面那个早已删除的 `GRU` 类 / `compare_gru` 参数，
@@ -34,7 +34,6 @@ import sys
 
 import pytest
 import torch
-from torch import nn
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "examples"))
@@ -124,14 +123,6 @@ def test_get_gru_params_returns_documented_order():
             assert p[i].shape == (H, H), "第 %d 个位置应是 %s([H,H])" % (i, name)
         else:
             assert p[i].shape == (H,), "第 %d 个位置应是 %s([H])" % (i, name)
-
-
-def test_get_gru_params_from_net_shapes():
-    net = nn.GRUCell(F, H, bias=True)
-    W_xh, W_hh, b_h, W_xz, W_hz, b_z, W_xr, W_hr, b_r = gru.get_gru_params_from_net(net)
-    assert W_xh.shape == (F, H) and W_hh.shape == (H, H) and b_h.shape == (H,)
-    assert W_xz.shape == (F, H) and W_hz.shape == (H, H) and b_z.shape == (H,)
-    assert W_xr.shape == (F, H) and W_hr.shape == (H, H) and b_r.shape == (H,)
 
 
 # ===================== 2. 数值范围（doc §12） =====================
@@ -372,48 +363,6 @@ def test_candidate_applies_reset_to_the_recurrent_projection():
         "当前实现:  tanh( W_xh x + (r ⊙ h) W_hh + b_h )  <- reset 乘在了投影之前" % d)
 
 
-# ===================== 8. 与 nn.GRUCell 数值对齐 =====================
-#
-# 这一项**已知不一致**，所以标了 xfail（不是忽略，是"记录在案的失败"）。
-# 修好 get_gru_params_from_net / do_gru 的 candidate 写法之后，它会变成 XPASS，
-# pytest 会把它报成失败 —— 那时就该把它升级成真测试（strict 就是干这个的）。
-
-@pytest.mark.xfail(strict=True, reason="已知不一致：gate 分块顺序 + candidate 是教材变体")
-def test_matches_nn_grucell_step_by_step():
-    """get_gru_params_from_net 的映射 + do_gru 的公式，必须让手写实现等价于 nn.GRUCell。
-
-    实测三类原因（见测试输出里的误差量级）：
-      1) get_gru_params_from_net 的 gate 分块顺序：PyTorch 是 [r | z | n]，
-         代码取的是 (h←r, r←z, z←n)，整体串位一位；
-      2) 只读了 bias_ih，漏了 bias_hh（PyTorch 两个都用；且 candidate 的
-         b_hh 必须乘在 reset gate **里面**）；
-      3) do_gru 的 candidate 写成 (r ⊙ h) W_hh + b_h，
-         而 PyTorch / RNNoise 都是 r ⊙ (W_hh h + b_hh) —— 结构性差异，
-         光靠参数映射补不回来。
-    """
-    torch.manual_seed(0)
-    net = nn.GRUCell(F, H, bias=True)
-
-    inputs, h0 = make_inputs(), make_hidden()
-    params = gru.get_gru_params_from_net(net)
-
-    states, _, _, _ = gru.do_gru(inputs, params, h0.clone())
-
-    h = h0.clone()
-    ref = []
-    for t in range(T):
-        h = net(inputs[t], h)
-        ref.append(h.clone())
-
-    worst = max((states[t] - ref[t]).abs().max().item() for t in range(T))
-    assert worst < F32_ATOL, (
-        "手写 GRU 与 nn.GRUCell 不一致，最大绝对误差 %.3e。\n"
-        "排查顺序：\n"
-        "  1) get_gru_params_from_net 的分块顺序（应为 [r | z | n]）；\n"
-        "  2) bias_hh 是否参与（candidate 的 b_hh 要乘在 reset 里面）；\n"
-        "  3) candidate 是 r ⊙ (W_hh h) 还是 (r ⊙ h) W_hh。" % worst)
-
-
 # ===================== 9. GRUMo：真正接进整网的那个包装 =====================
 #
 # 旧版这里测的是 `rnn_unit.GRU`，那个类已经不存在了。现在整网用的是
@@ -453,19 +402,17 @@ def test_gruscratch_carries_hidden_state_between_calls():
     h0 = torch.zeros(H, dtype=torch.float32)           # 初始隐状态 = 0（C 侧同样 memset）
     x = torch.randn(F, dtype=torch.float32)
 
-    h1, detail = net(x, h0)                            # 状态从参数进、从返回值出
+    h1 = net(x, h0)                                    # 状态从参数进、从返回值出
     assert h1.shape == (H,)
     assert h1.dtype == torch.float32
     assert not torch.allclose(h1, h0), "喂了输入就不该原地不动"
-    assert set(detail) == {"zrh_recur", "sigmoid", "recur_tanh", "h", "state"}
-    assert torch.allclose(detail["state"], h1), "detail['state'] 与返回的 h 应当同值"
 
-    h2, _ = net(x, h1)
+    h2 = net(x, h1)
     assert not torch.allclose(h2, h1), "第二帧必须拿第一帧的结果当历史"
 
     # ★ 无隐藏状态：同样的 (x, h_in) 必须得到同样的 h_out。
     #   这条是为了防止有人把状态又塞回 self.hidden（那样 ONNX 会每次从 0 开始）。
-    assert torch.allclose(net(x, h0)[0], h1)
+    assert torch.allclose(net(x, h0), h1)
 
 
 if __name__ == "__main__":

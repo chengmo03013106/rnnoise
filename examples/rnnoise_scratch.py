@@ -10,20 +10,29 @@
 用例来自 `scripts/unit_cases/*.json`（真实模型规模的 //16）。
 
 打印：本类**完全不打印**（2026-10-08 起 `GRUMo` 也不再打印）——
-`forward` 把 8 项全部返回，协议行由调用方去打，
+`forward` 只返回结果，协议行由调用方去打，
 见 `examples/rnn_unit.py: rnnoise_demo_2()`。这也是能被 trace / 导出的前提。
 
-★ 离 `torch.onnx.export` 的现状（2026-10-09 **逐条实测过**，不是推测）：
-  ① （已解决）权重进参数表了：`GRUMo` 的 4 组权重改成 `register_buffer`
-     （`W_xzrh` / `b_xzrh` / `W_hzrh` / `b_hzrh`，实测 `state_dict()` 里能看到它们）；
-     7 个子层都注册成功（`named_children()` = conv1/conv2/gru1..3/dense/vad_dense），
-     `eval()` / `.to()` 也都正常。
-  ② 唯一还差的一件事：状态还没进图 —— `Conv1D` / `GRUMo` 本身**已经**是"状态参数进出"
-     （`out, mem = net(data, mem)`、`h_out, detail = net(x, h_in)`），但本类又替它们把状态
-     存回 `self.conv1_mem` / `self.conv2_mem` / `self.gru1_state..gru3_state`。
-     静态图里状态必须显式进出（同 LLM 的 KV cache）：把这 5 个状态一起做成
-     `forward` 的参数与返回值即可。
-  （已解决·2026-10-08：打印副作用已消除 —— `GRUMo` 不再打印，本类也不再持有 `out`。）
+★ 状态（Explicit State）—— 2026-10-09 已参数化：
+  5 个跨帧状态（conv1/conv2 的 mem + 三层 GRU 的 hidden）全部
+  ① 用 `register_buffer` 注册：进 `state_dict()`、`.to()` / `.eval()` 管得住，
+     同时是「全 0 初值」的**唯一出处**；
+  ② **打包成一个 `state` 参数**在 `forward` 进、出一个新 `state`：`forward` 里不写
+     `self.*`，只用传进来的参数，算完把新状态一起返回，由调用方在下一帧喂回。
+
+  静态图没有「对象属性」这个概念（同 LLM 的 KV cache），状态必须显式进出；
+  这样 `torch.onnx.export` 才能把它变成 graph 的 inputs / outputs。
+
+  调用形态（`state` 顺序 = conv1_mem, conv2_mem, gru1_state, gru2_state, gru3_state）：
+      state = net.init_state()                  # 初值（buffer 的 clone）
+      state, (gains, vad) = net(data, state)    # 每帧都是同一个写法
+
+  打包成一个参数（而不是 5 个位置参数），是为了不让「顺序」散落到每个调用点 ——
+  顺序只在 `init_state()` / `forward` 里各定义一次，改了一处就全对。
+
+  签名里**只有张量**（`data` + 5 个状态）：帧号是"只用于日志的 int"，
+  `torch.onnx.export` 不能把它当 graph input，所以它留在调用方的循环里（`enumerate`），
+  不进 `forward`。
 """
 
 import torch
@@ -35,8 +44,10 @@ from linear import Conv1D, DenseLayer
 class RNNoiseMo(nn.Module):
     """整网：conv1 / conv2 / gru1..3 / dense_out / vad_dense。
 
-    一次吃一帧（`forward(frame, data)`）：conv 的 mem 和三层 GRU 的隐状态都存在
-    各自的子对象里，所以**同一个实例必须按帧顺序连续调用**，不能跳帧或复用。
+    一次吃一帧，5 个跨帧状态（conv1_mem / conv2_mem / gru1_state / gru2_state /
+    gru3_state）**打包成一个 `state` 参数显式进出**：由调用方持有，每帧喂进来、
+    再把新的拿回去。初值用 `init_state()` 取（那 5 个 register_buffer 的 clone），
+    对象里不存活动状态，所以同一个实例可以跳帧 / 复用。
 
     cases:         examples/loader.py 读出来的用例 {层名: case}
     low_accuracy:  激活档次（True -> 多项式近似 = C 默认；False -> torch 自带）
@@ -56,9 +67,10 @@ class RNNoiseMo(nn.Module):
                             low_accuracy=low_accuracy)
 
         # Conv1D 不再自带状态：mem 由调用方持有，长度 = nb_input - input_size = 2 帧宽。
-        # ★ 现在还放在实例属性里 —— 要导出 ONNX 得把它们改成 forward 的输入/输出。
-        self.conv1_mem = torch.zeros(input_features * 2, dtype=torch.float32)
-        self.conv2_mem = torch.zeros(nb_out * 2, dtype=torch.float32)
+        # register_buffer：既进 state_dict（.to()/.eval() 管得住），又是「全 0 初值」的出处；
+        # 真正参与计算的是 forward 的 state 参数里的对应分量（见 forward / init_state）。
+        self.register_buffer('conv1_mem', torch.zeros(input_features * 2, dtype=torch.float32))
+        self.register_buffer('conv2_mem', torch.zeros(nb_out * 2, dtype=torch.float32))
 
         # gruN：每帧输入宽 = conv2 输出宽 = 隐状态宽 N，门输出宽 = 3N
         # ['layer', 'input_weights_float', 'input_bias', 'recurrent_weights_float',
@@ -73,11 +85,12 @@ class RNNoiseMo(nn.Module):
         self.gru3 = GRUMo(hidden_size, hidden_size, gru_out_size, cases['gru3'],
                           low_accuracy=low_accuracy)
 
-        # 同理，GRUMo 的隐状态也由调用方持有（forward(x, hidden)），本类替它存着。
-        # ★ 现在还放在实例属性里 —— 导出 ONNX 时要和三块 mem 一起改成 forward 的输入/输出。
-        self.gru1_state = torch.zeros(hidden_size, dtype=torch.float32)
-        self.gru2_state = torch.zeros(hidden_size, dtype=torch.float32)
-        self.gru3_state = torch.zeros(hidden_size, dtype=torch.float32)
+        # 同理，GRUMo 的隐状态也由调用方持有（forward(x, hidden)）。
+        # 和两块 conv mem 一样：register_buffer 只负责「初值 + 进 state_dict」，
+        # 计算时用 forward 的 state 参数里传进来的那一个。
+        self.register_buffer('gru1_state', torch.zeros(hidden_size, dtype=torch.float32))
+        self.register_buffer('gru2_state', torch.zeros(hidden_size, dtype=torch.float32))
+        self.register_buffer('gru3_state', torch.zeros(hidden_size, dtype=torch.float32))
 
         # 输出层：输入宽 = conv2 输出 + 3 层 gru 的隐状态 = 4 x (nb_out*3)
         dense_in = hidden_size * 3 + nb_out * 3
@@ -86,30 +99,51 @@ class RNNoiseMo(nn.Module):
         self.vad_dense = DenseLayer(dense_in, 1, cases['vad_dense'],
                                     low_accuracy=low_accuracy)
 
-    def forward(self, frame, data):
-        """跑一帧。
+    def init_state(self):
+        """取 5 个状态的初值 —— 顺序与 `forward` 的 `state` 参数、返回值完全一致：
 
-        frame: 帧号 —— **只用于日志/定位**，不参与任何计算
+            (conv1_mem, conv2_mem, gru1_state, gru2_state, gru3_state)
+
+        唯一出处是那几个 register_buffer（构造时全 0）。这里 **clone 一份**再返回：
+        调用方拿到的是自己的副本，之后就算原地改也污染不到 buffer 的初值
+        （对张量 `a = b` 只是再绑一个名字；`.detach()` / `.view()` / 切片都不隔离内存）。
+        """
+        return (self.conv1_mem.clone(), self.conv2_mem.clone(),
+                self.gru1_state.clone(), self.gru2_state.clone(),
+                self.gru3_state.clone())
+
+    def forward(self,data, state):
+        """跑一帧 —— **状态显式进出**，本方法不读写 self 上的任何状态。
+
         data:  这一帧的输入，长度 = conv1 的输入宽
+        state: 上一帧的 5 个状态，顺序
+               (conv1_mem, conv2_mem, gru1_state, gru2_state, gru3_state)；
+               初值用 `init_state()` 取。
 
-        返回 (conv1_out, conv2_out, gru1_state, gru2_state, gru3_state,
-              dense_in, gains, vad) 八项，顺序和协议行一致。
+        返回 `(state, (gains, vad))`：
+            state        更新后的 5 元组，顺序与传进来的完全一致
+            (gains, vad) 两个最终输出
+
+        这 7 个张量正好对应 ONNX 图的 outputs（5 个状态 + 2 个输出）；
+        conv1_out / conv2_out / dense_in 是纯调试量，不再返回
+        （要对比就去看内联版 `all` 单元）。
         **本方法不打印任何东西**：协议行由调用方按这份返回值去打
         （见 `examples/rnn_unit.py: rnnoise_demo_2()`）。
         """
-        conv1_output, self.conv1_mem = self.conv1(data, self.conv1_mem)
+        conv1_mem, conv2_mem, gru1_state, gru2_state, gru3_state = state
+        conv1_output, conv1_mem = self.conv1(data, conv1_mem)
 
-        conv2_output, self.conv2_mem = self.conv2(conv1_output.flatten(), self.conv2_mem)
+        conv2_output, conv2_mem = self.conv2(conv1_output.flatten(), conv2_mem)
 
-        # forward 返回 (新隐状态, 中间量 dict)：这里只取隐状态
-        self.gru1_state, _ = self.gru1(conv2_output.flatten(), self.gru1_state)
+        # forward 只返回新隐状态（GRUMo 现在不再返回中间量 detail）
+        gru1_state = self.gru1(conv2_output.flatten(), gru1_state)
 
-        self.gru2_state, _ = self.gru2(self.gru1_state, self.gru2_state)
+        gru2_state = self.gru2(gru1_state, gru2_state)
 
-        self.gru3_state, _ = self.gru3(self.gru2_state, self.gru3_state)
+        gru3_state = self.gru3(gru2_state, gru3_state)
 
-        dense_in = torch.cat((conv2_output.flatten(), self.gru1_state.flatten(),
-                              self.gru2_state.flatten(), self.gru3_state.flatten()), dim=0)
+        dense_in = torch.cat((conv2_output.flatten(), gru1_state.flatten(),
+                              gru2_state.flatten(), gru3_state.flatten()), dim=0)
 
         # dense
         gains = self.dense(dense_in)
@@ -117,5 +151,5 @@ class RNNoiseMo(nn.Module):
         # vad
         vad = self.vad_dense(dense_in)
 
-        return (conv1_output, conv2_output, self.gru1_state, self.gru2_state,
-                self.gru3_state, dense_in, gains, vad)
+        return (conv1_mem, conv2_mem, 
+            gru1_state, gru2_state, gru3_state), (gains, vad)

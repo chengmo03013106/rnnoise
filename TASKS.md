@@ -137,8 +137,30 @@ Step 6  完整 RNNoise：C → PyTorch → ONNX → ORT  # 真实项目
 
 ### 4.4 `RNNoiseMo` 导出阻塞点（按概念归类，不逐个盲修）
 
-早期逐条记过 12 项，现已解决大半：`nn.Module` ✓、子模块注册 ✓、权重 `register_buffer` ✓、
-`forward` 无打印 ✓、状态参数化（`Conv1D` / `GRUMo` 都是 `out/state` 进出）✓。
+早期逐条记过 12 项，现已解决：`nn.Module` ✓、子模块注册 ✓、权重 `register_buffer` ✓、
+`forward` 无打印 ✓、状态参数化（`Conv1D` / `GRUMo` 都是 `out/state` 进出）✓、
+**`RNNoiseMo` 整网的 5 个状态也已参数化（2026-10-09）✓**：
+`conv1_mem` / `conv2_mem` / `gru1_state..gru3_state` 用 `register_buffer` 注册（进 `state_dict`，
+同时是全 0 初值的唯一出处），并**打包成一个 `state`** 在 `forward` 显式进出：
+
+```
+forward(data, state) -> (state, (gains, vad))
+    state = (conv1_mem, conv2_mem, gru1_state, gru2_state, gru3_state)
+
+state = net.init_state()                 # 初值（buffer 的 clone）
+state, (gains, vad) = net(data, state)   # 每帧同一个写法
+```
+
+`frame`（帧号）已从 `forward` 移出：它是**只用于日志的 int**，不是张量，
+`torch.onnx.export` 不能把它当 graph input。帧号属于"编排"，由调用方在
+`enumerate(inputs)` 里自己记（见 `examples/rnn_unit.py: rnnoise_demo_2()`）。
+
+打包（而不是 5 个位置参数）是为了让状态顺序只在 `init_state` / `forward` 各定义一次 ——
+之前 flat 写法换顺序导致调用方静默解包错位（`all2` 挂过一次）。
+
+连带影响：`all2` 单元（走类）现在只打 5 项协议行，比内联的 `all` 少
+`conv1.out` / `conv2.out` / `dense.in` 三个调试量（那三个要用 C 对齐就看 `all`）。
+
 **剩下的按概念顺序推**：
 
 ```
@@ -146,8 +168,15 @@ Model Contract → Pure Tensor Forward → Explicit State
 → Input/Output Contract → torch.export / ONNX Exporter → ONNX Graph → ORT
 ```
 
-当前唯一硬阻塞：`RNNoiseMo` 仍把 5 个状态（conv1/conv2 的 mem + 三层 gru 的 hidden）
-存在实例属性里，必须改成 `forward` 的输入/输出。
+`frame` 已移出 `forward`（2026-10-09），签名现在**全是张量**（`data` + 5 个状态），
+可以交给 `torch.onnx.export` 了。
+
+当前阻塞点转到**导出链路本身**：`examples/ort_demo.py: create_trace_rnnoise_onnx()`
+仍停在实跑循环后的 `return` 上，导出段没接上 → 不产出 `.onnx` → `main()` 撞 `NoSuchFile`。
+待办：接上 export → `onnx.checker` → Netron 看图 → 列 graph inputs/outputs →
+**PyTorch 输出 ≈ ORT 输出**（这一步不能省）。
+注意 `dynamic_axes`：这里的 `x` 是**单帧 1-D 向量**（第 0 轴是特征维不是 batch），
+不要再按 batch 声明（`GRUMo` 导出时踩过同一个坑）。
 
 > 核心认知：RNNoise 是**状态机式实时模型**，ONNX 偏向**显式输入 → 显式计算图 → 显式输出**，二者之间存在 **Representation Gap**——这才是真正的技术含量。
 

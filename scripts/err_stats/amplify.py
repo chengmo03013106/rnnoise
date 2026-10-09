@@ -77,7 +77,7 @@ def run_chain(cases, low_accuracy, no_recurrence=False):
         for k, g in enumerate(grus):
             if no_recurrence:
                 hidden[k] = torch.zeros_like(hidden[k])
-            hidden[k], _ = g(x, hidden[k])
+            hidden[k] = g(x, hidden[k])
             out["gru%d.state" % (k + 1)].append(hidden[k])
             x = hidden[k]
 
