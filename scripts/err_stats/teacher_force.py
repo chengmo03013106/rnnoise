@@ -74,8 +74,8 @@ def build_layers(cases, low_accuracy):
     conv2 = U.Conv1D(nb_out * 3, nb_out * 3, cases["conv2"], nb_out, low_accuracy=low_accuracy)
     g_in = g_h = nb_out * 3
     g_out = g_in * 3
-    grus = [U.GRUScratch(g_in, g_h, g_out, cases["gru%d" % k], layer="gru%d" % k,
-                         detail=False) for k in (1, 2, 3)]
+    grus = [U.GRUMo(g_in, g_h, g_out, cases["gru%d" % k], low_accuracy=low_accuracy)
+            for k in (1, 2, 3)]
     dense_in = g_h * 3 + nb_out * 3
     dense = U.DenseLayer(dense_in, 2, cases["dense_out"], low_accuracy=low_accuracy)
     vad = U.DenseLayer(dense_in, 1, cases["vad_dense"], low_accuracy=low_accuracy)
@@ -87,26 +87,32 @@ def run_teacher_forced(cases, cdata, low_accuracy):
     conv1, conv2, grus, dense, vad = build_layers(cases, low_accuracy)
     out = collections.defaultdict(list)
     inputs = torch.tensor(cases["conv1"]["inputs"], dtype=torch.float32)
+    # conv 的 mem 由调用方持有（Conv1D 不再自带状态）：长度 = nb_input - input_size
+    conv1_mem = torch.zeros(cases["conv1"]["nb_in"] * 2, dtype=torch.float32)
+    conv2_mem = torch.zeros(cases["conv1"]["nb_out"] * 2, dtype=torch.float32)
+    # gru 的隐状态宽度 = nb_out * 3（= conv2 输出宽）
+    g_h = cases["conv1"]["nb_out"] * 3
 
     for f in range(NFRAMES):
         def cvec(item, frame):
             return torch.tensor(cdata[(item, frame)], dtype=torch.float32)
 
         # conv1：输入本来同源（都用 json 的 conv1.inputs），mem 从 0 开始
-        c1 = conv1(inputs[f])[0]
-        out["conv1.out"].append(c1)
+        c1, conv1_mem = conv1(inputs[f], conv1_mem)
+        out["conv1.out"].append(c1[0])
 
         # conv2：喂 C 的 conv1.out#f（mem 同样从 0 开始）
-        c2 = conv2(cvec("conv1.out", f))[0]
-        out["conv2.out"].append(c2)
+        c2, conv2_mem = conv2(cvec("conv1.out", f), conv2_mem)
+        out["conv2.out"].append(c2[0])
 
         # gru1/2/3：输入和 hidden 全部取 C 的
         for k, g in enumerate(grus):
             src = "conv2.out" if k == 0 else "gru%d.state" % k
             x = cvec(src, f)
-            g.hidden = (torch.zeros(g.hidden.shape[0], dtype=torch.float32) if f == 0
-                        else cvec("gru%d.state" % (k + 1), f - 1))
-            h = g(x, low_accuracy=low_accuracy, out=None, frame=f)
+            # 隐状态由调用方持有（GRUMo 的 forward(x, hidden)）：这里把 C 的 state 当入参喂进去
+            h_in = (torch.zeros(g_h, dtype=torch.float32) if f == 0
+                    else cvec("gru%d.state" % (k + 1), f - 1))
+            h, _ = g(x, h_in)
             out["gru%d.state" % (k + 1)].append(h)
 
         # dense / vad：喂 C 的 dense.in#f

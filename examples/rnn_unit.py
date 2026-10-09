@@ -22,7 +22,7 @@
 
 本文件只留「单元的 runner + CLI」，其余的都拆出去只留一份：
     examples/linear.py  Linear / DenseLayer / Conv1D + conv1d 单元
-    examples/gru.py     GRU 递推（do_rnnoise_gru_step / GRUScratch）
+    examples/gru.py     RNN / GRU 手撕练习（RNNScratch / do_gru）+ 整网用的 GRUMo
     examples/utils.py   输出协议 emit() + 从用例取张量的 case_tensor()
     examples/loader.py  用例加载（load_unit_cases / 规模常量 / CaseError）
     （另：examples/linear.py 单独跑起来是个「线性层手工实验」，它不是单元，见那边的 USAGE）
@@ -41,9 +41,9 @@ import torch
 
 # 显式重新导入这些名字，是为了保持既有接口不变（**不是**本地重复定义，定义体都在各自模块里）：
 # scripts/err_stats/*.py 按 `import rnn_unit as U` 用 U.Conv1D / U.DenseLayer / U.Linear /
-# U.GRUScratch / U.load_unit_cases —— 以后拆模块时别把这些名字断掉。
+# U.GRUMo / U.load_unit_cases —— 以后拆模块时别把这些名字断掉。
 # （tests/ 直接测 examples/gru.py，不再从这里取 get_gru_params。）
-from gru import GRUScratch as GRUScratch
+from gru import GRUMo as GRUMo
 from linear import Conv1D, DenseLayer, Linear, conv1d_demo
 from rnnoise_scratch import RNNoiseMo as RNNoiseMo
 from utils import emit
@@ -57,6 +57,16 @@ from loader import (
     load_unit_cases,
 )
 
+# 对外契约：上面这些**再导出**的名字，`scripts/err_stats/*.py` 按 `import rnn_unit as U` 取用。
+# 列进 `__all__` 一举两得：既是契约文档，也让静态检查知道
+# `Linear` 这种"本地不用、只为再导出"的名字不是多余导入。
+# （pyflakes **不认** `# noqa` —— 那是 flake8 的功能，加了不起作用。）
+__all__ = [
+    "Conv1D", "DenseLayer", "Linear", "GRUMo", "emit",
+    "CaseError", "load_unit_cases",
+    "GRU_LAYERS", "GRU_N", "GRU_INPUT_SIZE", "GRU_OUTPUT_SIZE",
+]
+
 
 def gru_demo(cases, low_accuracy=True, out=sys.stdout):
     '''对比 RNNoise 里 C 实现和 PyTorch 实现的输出。
@@ -66,8 +76,8 @@ def gru_demo(cases, low_accuracy=True, out=sys.stdout):
     low_accuracy=True  -> rnnoise_activation 里手写的多项式近似（对应 C 默认）
     low_accuracy=False -> torch 自带 sigmoid/tanh（对应 C 的 -DHIGH_ACCURACY）
 
-    同一份实现被 gru1 / gru2 / gru3 三层复用，三层规模相同，所以这里按层循环，
-    把层名作为协议行的前缀传给 GRUScratch。
+    同一份实现被 gru1 / gru2 / gru3 三层复用，三层规模相同，所以这里按层循环；
+    层名只是协议行的前缀，由本函数（runner）加 —— GRUMo 自己不打印。
     输入序列只有 gru1 那一段有，三层共用（C 侧 gru_unit() 同样如此）。
     '''
     input_features_size = GRU_INPUT_SIZE
@@ -91,11 +101,20 @@ def gru_demo(cases, low_accuracy=True, out=sys.stdout):
                             "（输入序列统一用 %s 那份）" % (layer, GRU_LAYERS[0]))
         # 每层新建一个实例：隐状态从 0 开始（C 侧 gru_unit() 也是每层 memset 一次），
         # 不用用例 json 里的 state —— 两侧从同一起点递推，每次运行的起点也一样。
-        net = GRUScratch(input_features_size, hidden_size, output_features_size,
-                         case, layer=layer)
-        # GRUScratch 一次只吃一帧，整段序列自己按帧循环（和 C 的 gru_unit() 同一个结构）
+        # low_accuracy 是**构造函数**参数（GRUMo 在 __init__ 里快照激活函数）
+        net = GRUMo(input_features_size, hidden_size, output_features_size, case,
+                    low_accuracy=low_accuracy)
+        # 隐状态由调用方持有（forward(x, hidden)）：每层各自一份、从 0 开始，
+        # 逐帧把上一次返回的新隐状态接回去。
+        hidden = torch.zeros(hidden_size, dtype=torch.float32)
+        # 本单元要打的 5 项，顺序 = C 的 local_compute_generic_gru() 的打印顺序
+        detail_items = ("zrh_recur", "sigmoid", "recur_tanh", "h", "state")
+        # GRUMo 一次只吃一帧，整段序列自己按帧循环（和 C 的 gru_unit() 同一个结构）
         for frame, x in enumerate(inputs_data):
-            net(x, low_accuracy=low_accuracy, out=out, frame=frame)
+            # forward 返回 (新隐状态, 中间量 dict)；中间量随返回值出来，本类不打印也不存 self
+            hidden, detail = net(x, hidden)
+            for item in detail_items:
+                emit(layer, item, frame, detail[item], out)
 
 
 def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
@@ -114,19 +133,25 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
     conv2 = Conv1D(nb_out * 3, nb_out*3, cases['conv2'], nb_out,
                    low_accuracy=low_accuracy)
 
+    # mem 由调用方持有（Conv1D 不再自带状态）：长度 = nb_input - input_size = 2 帧宽。
+    # C 侧也是从全 0 开始。
+    conv1_mem = torch.zeros(input_features * 2, dtype=torch.float32)
+    conv2_mem = torch.zeros(nb_out * 2, dtype=torch.float32)
+
     # ['layer', 'input_weights_float', 'input_bias', 'recurrent_weights_float', 'recurrent_bias', 'state', 'inputs']
     gru1_case = cases['gru1']
     gru_input_size = hidden_size = nb_out*3
     gru_out_size = gru_input_size * 3
 
-    gru1 = GRUScratch(gru_input_size, hidden_size, gru_out_size,
-                    gru1_case, layer=gru1_case['layer'], detail=False)
+    # low_accuracy 走构造函数（GRUMo 在 __init__ 里快照激活函数）
+    gru1 = GRUMo(gru_input_size, hidden_size, gru_out_size, gru1_case,
+                 low_accuracy=low_accuracy)
 
-    gru2 = GRUScratch(gru_input_size, hidden_size, gru_out_size,
-                    cases['gru2'], layer=cases['gru2']['layer'], detail=False)
+    gru2 = GRUMo(gru_input_size, hidden_size, gru_out_size, cases['gru2'],
+                 low_accuracy=low_accuracy)
 
-    gru3 = GRUScratch(gru_input_size, hidden_size, gru_out_size,
-                    cases['gru3'], layer=cases['gru3']['layer'], detail=False)
+    gru3 = GRUMo(gru_input_size, hidden_size, gru_out_size, cases['gru3'],
+                 low_accuracy=low_accuracy)
 
     dense = DenseLayer(hidden_size*3 + nb_out*3,
                        int((hidden_size*3 + nb_out*3)/(1536/32)), cases['dense_out'],
@@ -138,20 +163,29 @@ def rnnoise_demo(cases, low_accuracy=True, out=sys.stdout):
 
     assert inputs_data.shape[1] == 4
 
+    # 三层 gru 的隐状态由调用方持有（forward(x, hidden)），各自从 0 开始、逐帧接回
+    gru1_state = torch.zeros(hidden_size, dtype=torch.float32)
+    gru2_state = torch.zeros(hidden_size, dtype=torch.float32)
+    gru3_state = torch.zeros(hidden_size, dtype=torch.float32)
+
     for frame, data in enumerate(inputs_data):
-        conv1_output = conv1(data)
+        conv1_output, conv1_mem = conv1(data, conv1_mem)
 
         print(f'conv1 {frame}:{conv1_output}')
         emit('conv1', "out", frame, conv1_output[0], out)
 
-        conv2_output = conv2(conv1_output.flatten())
+        conv2_output, conv2_mem = conv2(conv1_output.flatten(), conv2_mem)
         emit('conv2', "out", frame, conv2_output[0], out)
 
-        gru1_state = gru1(conv2_output.flatten(), low_accuracy=low_accuracy, out=out, frame=frame)
+        gru1_state, _ = gru1(conv2_output.flatten(), gru1_state)
+        # gruN.state 现在由这里打（GRUMo 不再自己打印）
+        emit('gru1', "state", frame, gru1_state, out)
 
-        gru2_state = gru2(gru1_state, low_accuracy=low_accuracy, out=out, frame=frame)
+        gru2_state, _ = gru2(gru1_state, gru2_state)
+        emit('gru2', "state", frame, gru2_state, out)
 
-        gru3_state = gru3(gru2_state, low_accuracy=low_accuracy, out=out, frame=frame)
+        gru3_state, _ = gru3(gru2_state, gru3_state)
+        emit('gru3', "state", frame, gru3_state, out)
         dense_in = torch.cat((conv2_output.flatten(), gru1_state.flatten(), gru2_state.flatten(), gru3_state.flatten()), dim=0)
         # 拼给 dense / vad 的输入（对应 C 的 [dense.in#帧]）
         emit('dense', "in", frame, dense_in, out)
@@ -174,13 +208,28 @@ def rnnoise_demo_2(cases, low_accuracy=True, out=sys.stdout):
     两者输出必须**逐字节相同**：`./rnn_unit all` vs `./rnn_unit all2`
     （或 `uv run examples/rnn_unit.py all` vs `... all2`）。
     """
-    rnn = RNNoiseMo(cases, low_accuracy=low_accuracy, out=out)
+    # 模型不打印（RNNoiseMo / GRUMo 都不打）：协议行在这里按 forward 的返回值统一打，
+    # 顺序与 C 的 conv_gru_unit() 一致。
+    rnn = RNNoiseMo(cases, low_accuracy=low_accuracy)
 
     inputs_data = torch.tensor(cases['conv1']['inputs'], dtype=torch.float32)
     assert inputs_data.shape[1] == 4
 
     for frame, data in enumerate(inputs_data):
-        rnn.forward(frame, data)
+        (conv1_output, conv2_output, gru1_state, gru2_state, gru3_state,
+         dense_in, gains, vad) = rnn.forward(frame, data)
+
+        # 这行是调试遗留（内联版 rnnoise_demo 里也有），为了两边逐字节可比先保留
+        print(f'conv1 {frame}:{conv1_output}')
+
+        emit('conv1', "out", frame, conv1_output[0], out)
+        emit('conv2', "out", frame, conv2_output[0], out)
+        emit('gru1', "state", frame, gru1_state, out)
+        emit('gru2', "state", frame, gru2_state, out)
+        emit('gru3', "state", frame, gru3_state, out)
+        emit('dense', "in", frame, dense_in, out)
+        emit('dense', "gains", frame, gains[0], out)
+        emit('vad', "out", frame, vad[0], out)
 
 
 # 只放**真单元**（有 C 侧对手、打协议行、unit_check.py 会跑）。

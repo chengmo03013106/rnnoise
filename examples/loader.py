@@ -8,7 +8,7 @@
     from loader import load_unit_cases, case_path, GRU_LAYERS, ...
 
 同目录的模块之间用**裸 import**（`from loader import ...`），
-和 `rnn_unit.py` 里 `from gru import GRUScratch` 是同一种做法 ——
+和 `rnn_unit.py` 里 `from gru import GRUMo` 是同一种做法 ——
 Python 跑 `examples/xxx.py` 时会把脚本所在目录放进 `sys.path`，
 所以不需要额外的路径处理。
 

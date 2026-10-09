@@ -7,11 +7,11 @@
 
 这两件事原先在别处被写了两遍：
   - `emit()`             rnn_unit.py 和 gru.py 各有一份（签名还不一样）
-  - `torch.tensor(...)`  Linear.__init__ 和 get_gru_params_from_case 各写一遍
+  - `torch.tensor(...)`  Linear.__init__ 和 gru.py 各写一遍
 现在都收到这里，只留一份。
 
 同目录的模块之间用**裸 import**（`from utils import emit`），和 `rnn_unit.py` 里
-`from gru import GRUScratch` 是同一种做法：Python 跑 `examples/xxx.py` 时会把
+`from gru import GRUMo` 是同一种做法：Python 跑 `examples/xxx.py` 时会把
 脚本所在目录放进 `sys.path`，所以不需要额外的路径处理。
 
 对应 C 侧：`examples/rnn_unit_util.c`（那里的 print_item() 已经被

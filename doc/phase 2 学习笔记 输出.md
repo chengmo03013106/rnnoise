@@ -165,9 +165,173 @@ forward() 执行直接带所有需要的参数，使用 类变量则没有意义
 
 简单过了一次规范，使用 protobuffer 语法描述 ✅
 
+sigmoid 问题： 结果所有元素都是1
+因为 张量中的元素跨度太大，导致整个 结果过大，顶着sigmiod(x) 的上界，让 pre-activation 落在有区分度的区间（约 [-4, 4]
+
+**mac 使用的CPU 是 x86_64， pytroch 最高支持到 2.2.2，troch.onnx.export 使用与当前版本不同**
+
 然后直接做 `PyTorch RNNoise` 导出 `rnnoise.onnx` -> 再导入 -> 在用 `netron` 看
 
-export 约定
+TODO 问题：
 
-模块继承 nn.Module
-模型参数 Parameter 实现
+export 导出有多个阶段？分别的错误示范是什么？
+
+对于你的 PyTorch 2.2 TorchScript 路线，我建议这样理解：
+
+```text
+① Model / input contract
+        ↓
+② Trace 或 Script
+        ↓
+③ TorchScript Graph
+        ↓
+④ ONNX symbolic translation
+        ↓
+⑤ ONNX Model
+        ↓
+⑥ ONNX checker / Runtime verification
+```
+
+这是你现在真正需要的阶段划分。
+
+
+
+state cannot be traced
+谁的state？trace 为了什么？
+
+Stateful model representation
+有状态的模型？模型是否有状态？
+
+
+Graph capture / pure tensor computation
+pure tensor 是什么？
+Graph capture 是什么？
+
+ONNX Export 为什么要求 graph-compatible forward
+graph-compatible forward是什么？
+
+Python side effect 指的是什么？
+
+torch.export -> onnx.export -> runtime
+
+`torch.onnx.export` 到底要求一个 `model` 满足什么 Export Contract？ 先把这个问题单独搞懂，再动 RNNoise。
+
+按顺序搞懂下面的问题
+
+
+对于你当前 PyTorch 2.2.2 环境，**不要这么理解。**
+
+你现在应该理解为：
+
+```text
+                    PyTorch 2.2.2
+
+PyTorch nn.Module
+       │
+       │
+       ▼
+torch.onnx.export()
+       │
+       │
+       ├── torch.jit.trace()
+       │       或
+       │   torch.jit.script()
+       │
+       ▼
+TorchScript Graph
+       │
+       │ ONNX symbolic translation
+       ▼
+ONNX Graph / Model
+       │
+       ▼
+ONNX Runtime
+```
+
+
+我读完了 https://docs.pytorch.org/docs/2.2/export.html 文档，文章中还引用了几篇文章作为推荐阅读，❌ 比如 https://docs.pytorch.org/docs/2.2/export.ir_spec.html， 但是这篇文章的前提是读者已经熟悉 torch.fx ， ❌ torch.fx[https://docs.pytorch.org/docs/2.2/fx.html] 现阶段我是否需要了解？
+
+
+| 内容                       | 现在            |
+| ------------------------ | ------------- |
+| `torch.onnx.export` 2.2  | **必须**        |
+| TorchScript              | **必须学核心部分**   |
+| `torch.jit.trace`        | **必须**        |
+| `torch.jit.script`       | **需要理解，不必深入** |
+| TorchScript `.graph`     | **必须**        |
+| ONNX Graph/Node/Operator | **必须**        |
+| ONNX IR Spec             | 只学用到的部分       |
+| FX                       | **暂时不学**      |
+| torch.export             | **只了解概念**     |
+| torch.export IR Spec     | **暂时不学**      |
+| TorchDynamo              | 暂时不学          |
+| AOT Autograd             | 暂时不学          |
+
+
+⭐️⭐️⭐️⭐️⭐️ PyTorch 2.2 官方把这条路线明确称为 **TorchScript-based ONNX Exporter**。([PyTorch Docs][https://docs.pytorch.org/docs/2.2/onnx_torchscript.html])
+
+**它现在就是你的主教材。**
+
+Example: AlexNet from PyTorch to ONNX
+        ↓
+Tracing vs Scripting 
+        ↓
+Avoiding Pitfalls  **陷阱**
+- Avoiding python built-in numpy array，使用 tensor，否则变成 constant 
+- 使用 item() 会把tensor 降级成 built-in
+- Avoiding to use tensor.data()
+- 不要使用  ++，+= 因为，使用 x=x+2
+
+Limitations / Types **限制**
+- 可以接受 int， float， list， tuple，dict，str
+- 使用 dict， str 进行的计算，tracing mode 在 one traced executed 会被认为 constant。
+- dict 在 outputs 会被展开， 并且 keys 被删除
+- str outputs 被删除
+
+Operator support
+- ❌ 读数据时不能使用负索引： data[torch.tensor([[1, 2], [2, -3]]), torch.tensor([-2, 3])] 
+- 写数据时： 
+  - 不要implict 使用广播
+  - 索引不能是负数
+错误信息 
+```shell
+RuntimeError: ONNX export failed: Couldn't export operator foo
+```
+
+dynamic_axes
+        ↓
+verification
+
+
+### 导出失败归因
+```text
+Stage 0:
+Python forward
+
+Stage 1:
+TorchScript trace
+
+1A:
+forward 能运行
+
+1B:
+trace 能运行
+
+Stage 2:
+TorchScript graph
+
+1C:
+trace graph 能生成
+
+1D:
+检查 graph 是否符合预期
+
+Stage 3:
+ONNX translation
+
+Stage 4:
+ONNX validation
+
+Stage 5:
+ORT execution
+```

@@ -35,7 +35,12 @@
 
 激活函数的近似实现已经独立到 `examples/rnnoise_activation.py`（tanh_approx /
 sigmoid_approx / sigmoid_from_tanh / check_sigmoid_diff / pick）；
-输出协议 emit() 和取参数的 case_tensor() 在 `examples/utils.py`（rnn_unit.py 也共用这一份）。
+取参数的 case_tensor() 在 `examples/utils.py`。
+
+★ 本文件**不打任何协议行**（2026-10-08 起）：`GRUMo.forward()` 把中间量以 dict 随返回值
+  一起给出（键名就是 C 的打印项名）—— 打哪几项、打到哪，全由调用方决定
+  （见 `examples/rnn_unit.py: gru_demo()`）。这样 trace / `torch.onnx.export` 里不会混进
+  Python 打印这种副作用。
 
 ---- 已知待修正：与 nn.GRUCell 对齐时误差很大（约 1e+00 量级）----
 
@@ -62,7 +67,7 @@ import torch
 from torch import nn          # get_gru_params_from_net() 的类型注解要用；缺了连模块都 import 不了
 
 from rnnoise_activation import pick
-from utils import case_tensor, emit
+from utils import case_tensor
 
 
 # =====================================================================
@@ -136,27 +141,9 @@ def rnn_demo():
         o = outputs[t * batch_size:(t + 1) * batch_size]
         print(f'step {t}  out:{o}, h:{h}')
 
-import pdb
 # =====================================================================
 # GRU
 # =====================================================================
-def get_gru_params_from_case(case,input_features_size, hidden_size, output_features_size):
-    # h@z/r/h_t-1 in using *_recurrent_weights_float in .c
-    # x@z/r/h_t-1 in using *_input_weights_float in .c
-    # case 是「某一层」的子对象（examples/loader.py 的 _load_gru_case() 里按层取出来）
-    W_xzrh = case_tensor(case, "input_weights_float",
-                         input_features_size * output_features_size,
-                         (input_features_size, -1))
-    b_xzrh = case_tensor(case, "input_bias", output_features_size)
-
-    W_hzrh = case_tensor(case, "recurrent_weights_float",
-                         hidden_size * output_features_size,
-                         (hidden_size, -1))
-    b_hzrh = case_tensor(case, "recurrent_bias", output_features_size)
-
-    return W_xzrh, W_hzrh, b_xzrh, b_hzrh
-
-
 def get_gru_params(input_features_size, hidden_size, output_features_size):
     """随机初始化 GRU 本体的 9 组参数（h / z / r 各 3 组）。
     output_features_size 这里用不到 —— GRU 本体没有输出层，
@@ -196,82 +183,11 @@ def get_gru_params_from_net(net: nn.GRUCell):
 
     return W_xh, W_hh, b_h, W_xz, W_hz, b_z, W_xr, W_hr, b_r
 
-def do_rnnoise_gru_step(x, params, hidden, low_accuracy=True, out=sys.stdout,
-                        layer="gru", frame=0, detail=True):
-    """按 RNNoise C 实现方式递推**一帧**（对应 src/nnet.c: compute_generic_gru()）。
-    weights 布局 [z|r|h]，hidden / x 各自有 bias，不单独计算 R、Z、H_candidate。
-
-    递推和 examples/rnn_unit.c 的 local_compute_generic_gru() 一一对应，
-    打印项名字也逐字节一致（<layer>.zrh_recur / <layer>.sigmoid /
-    <layer>.recur_tanh / <layer>.h / <layer>.state），脚本才能按 [name#frame] 配对。
-
-    ★ 一次只吃**一帧**：整段序列的递推由调用方按帧循环，状态也由调用方自己存 ——
-      和 C 一样（C 每次也只处理一帧，状态是调用方传进来的数组）。
-      整网里就是 gru1 的输出喂 gru2、gru2 的输出喂 gru3，三个 gru 各存各的隐状态。
-
-    x:            [F]   这一帧的输入（不是整段序列）
-    hidden:       [H]   上一帧的隐状态
-    frame:        帧号，只用于协议行（C 侧同样用调用方的循环变量）
-    low_accuracy: True  -> 用本文件手写的多项式近似（对应 C 的 vec_sigmoid / vec_tanh）
-                  False -> 用 torch.sigmoid / torch.tanh（对应 C 的 -DHIGH_ACCURACY）
-    out:          协议输出目标；None 表示不打印
-    layer:        层名，做协议行前缀（gru1 / gru2 / gru3 共用这一份实现）
-    detail:       True  -> 打全部 5 项（zrh_recur / sigmoid / recur_tanh / h / state），
-                          对应 C 的 gru 单元（走 `local_compute_generic_gru()`，中间量齐全）
-                  False -> 只打 `<layer>.state`，对应 C 的整网链路 `conv_gru_unit()`
-                          （那边走的是正版 `compute_generic_gru()`，拿不到中间量）
-
-    返回这一帧算出的新隐状态 [H]，调用方把它喂给下一帧。
-    """
-    hidden_size = hidden.shape[0]
-    W_xzrh, W_hzrh, b_xzrh, b_hzrh = params
-    # 高/低精度只换激活函数，递推本身完全一样
-    # （两套近似实现搬到了 examples/rnnoise_activation.py）
-    sigmoid, tanh = pick(low_accuracy)
-    # 一次算出 zrh：三个权重（z / r / h）的输入投影一起算，公式里都和 x 相乘
-    zrh = x @ W_xzrh + b_xzrh          # compute_linear(input_weights, zrh, in, arch);
-    # 一次算出 recur：三个权重的递归投影也一起算，都和 hidden_t-1 相乘
-    recur = hidden @ W_hzrh + b_hzrh   # compute_linear(recurrent_weights, recur, state, arch);
-
-    # C: for (i=0;i<2*N;i++) zrh[i] += recur[i];
-    pre = zrh[:hidden_size*2] + recur[:hidden_size*2]
-    if detail:
-        emit(layer, "zrh_recur", frame, pre, out)
-
-    # C: compute_activation(zrh, zrh, 2*N, ACTIVATION_SIGMOID, arch);
-    # z 和 r 一起过 sigmoid；只覆盖前 2N 个，zrh[2*N:] 仍是候选状态的输入投影
-    zrh[:hidden_size*2] = sigmoid(pre)  # [H*2]，收敛到 (0, 1)
-    if detail:
-        emit(layer, "sigmoid", frame, zrh[:hidden_size*2], out)
-
-    # 对应c代码
-    #   for (i=0;i<N;i++)
-    #       h[i] += recur[2*N+i]*r[i];
-    r = zrh[hidden_size:hidden_size*2]
-    # 注意上面那行 C 代码里 h 指向 zrh[2*N]，是复用了候选状态的输入投影，
-    # 所以这里必须补上 zrh[2*N:] 这一项（之前漏掉，导致和 C 不等价）
-    h_candidate = tanh(zrh[hidden_size*2:] + recur[hidden_size*2:]*r)
-    if detail:
-        emit(layer, "recur_tanh", frame, h_candidate, out)
-
-    # 对应c代码
-    # for (i=0;i<N;i++)
-    #     h[i] = z[i]*state[i] + (1-z[i])*h[i];
-    # for (i=0;i<N;i++)
-    #     state[i] = h[i];
-    z = zrh[:hidden_size]
-    h = z * hidden + (1 - z) * h_candidate
-    if detail:
-        emit(layer, "h", frame, h, out)
-    emit(layer, "state", frame, h, out)
-    return h
-
-
 def do_gru(inputs_data, params, hidden, low_accuracy=True):
     """逐时间步手写 GRU 前向（教材版）。
 
     注意这是**教材版**布局（9 组参数、`X @ W_xh` 那种写法），
-    不是 RNNoise 的 [z|r|h] 布局 —— 后者是 `do_rnnoise_gru_step()`。
+    不是 RNNoise 的 [z|r|h] 布局 —— 后者是 `GRUMo`（本文件上面那个类）。
     本函数的 candidate 用 `(r ⊙ H) @ W_hh`（教材常见变体），与 nn.GRUCell /
     RNNoise 的 `r ⊙ (W_hh·H + b_hh)` 数学上不等价（见文件头的「已知待修正」）。
 
@@ -319,61 +235,141 @@ def do_gru(inputs_data, params, hidden, low_accuracy=True):
     return states, resets, updates, candidates
 
 
-class GRUScratch(nn.Module):
-    """一层 RNNoise GRU：参数和隐状态都在实例里，逐帧调用。
+class GRUMo(nn.Module):
+    """一层 RNNoise GRU：权重是 buffer、隐状态由**调用方持有**，逐帧调用。
 
-    一次只喂**一帧**（x: [F]），返回这一帧算出的新隐状态；隐状态存在 self.hidden 里，
-    所以每个实例各维护自己那份 —— 整网里三个 gru 就是三个实例：
+    签名：`h_out, detail = net(x, h_in)` —— 一次只喂**一帧**（x: [F]），
+    把上一帧的隐状态 `h_in` 传进来；返回这一帧的新隐状态 `h_out`，
+    以及中间量 `detail`（dict，键名同 C 的打印项，只给调试/协议行用，不影响计算）。
+    激活档次 `low_accuracy` 是**构造函数**参数（这里快照成 self.sigmoid / self.tanh）。
 
-        h = gru1(x)     # gru1 的输出
-        h = gru2(h)     # 作为 gru2 的输入
-        h = gru3(h)     # gru2 的输出作为 gru3 的输入
+    状态参数化是为了 ONNX：静态图里没有"对象属性"，状态必须作为图的输入/输出显式进出
+    （同 LLM 的 KV cache in/out）。初始隐状态是零（C 侧同样 memset 成 0）。
 
-    整段序列要自己按帧循环：
+    整网里三层 gru 就是三个实例，逐帧把上一层的输出喂给下一层：
 
-        for frame in range(nb_frames):
-            h = net(x[frame], low_accuracy=..., out=out, frame=frame)
+        h1, _ = gru1(x,  h1)      # h1 是 gru1 自己的隐状态，跨帧延续
+        h2, _ = gru2(h1, h2)      # gru1 的输出当作 gru2 的输入
+        h3, _ = gru3(h2, h3)
 
     递推和 C 的 compute_generic_gru() 一致（C 每次也只处理一帧）。
-    初始隐状态是零 —— C 侧同样是 memset 成 0，用例 json 里的 state 只做完整性校验。
+
+    ★ 本类**不打印协议行**（2026-10-08 起）：中间量随返回值给出，打哪几项由调用方决定
+      （`examples/rnn_unit.py: gru_demo()` 按 C 的顺序打 5 项）。图里不该有 Python 打印 ——
+      这是能被 trace / 导出的前提。
     """
 
     def __init__(self, input_features_size, hidden_size, output_features_size,
-                 case=None, layer="gru", detail=True):
-        self.layer = layer
-        # detail=True  -> 打全部 5 项（和 C 的 gru 单元一致）
-        # detail=False -> 只打 <layer>.state（和 C 的整网链路 conv_gru_unit 一致）
-        self.detail = detail
-        if case:
-            self.params = get_gru_params_from_case(case,input_features_size, hidden_size, output_features_size)
-        else:
-            # 没给用例就给随机权重，布局必须和 case 那条路径一样：
-            # do_rnnoise_gru_step() 要的是 [z|r|h] 合并的 4 项。
-            # ★ 不能拿教材版的 get_gru_params()（9 项、h/z/r 分开）来顶 ——
-            #   那个是给 do_gru() 用的，塞进来 do_rnnoise_gru_step 会直接 ValueError。
-            n = hidden_size * 3
-            self.params = (
-                torch.randn((input_features_size, n), dtype=torch.float32),
-                torch.randn((hidden_size, n), dtype=torch.float32),
-                torch.zeros(n, dtype=torch.float32),
-                torch.zeros(n, dtype=torch.float32),
-            )
-        self.hidden = torch.zeros(hidden_size, dtype=torch.float32)
+                 case, low_accuracy=True):
+        # 必须先初始化 nn.Module 的基础设施（_parameters/_buffers/_modules/
+        # _state_dict_pre_hooks ...）：少了这一句，类虽然挂着 nn.Module 的壳，
+        # 但 state_dict() / named_buffers() / .eval() / .to() 全都会抛 AttributeError。
+        if case is None:
+            raise ValueError("gru case 参数 不能为空！")
 
-    def __call__(self, x, low_accuracy=True, out=sys.stdout, frame=0):
-        self.hidden = do_rnnoise_gru_step(x, self.params, self.hidden,
-                                          low_accuracy=low_accuracy, out=out,
-                                          layer=self.layer, frame=frame,
-                                          detail=self.detail)
-        return self.hidden
+        super().__init__()
+        
+        # h@z/r/h_t-1 in using *_recurrent_weights_float in .c
+        # x@z/r/h_t-1 in using *_input_weights_float in .c
+        # case 是「某一层」的子对象（examples/loader.py 的 _load_gru_case() 里按层取出来）
 
+        self.register_buffer(
+            "W_xzrh",
+            case_tensor(case, "input_weights_float",
+                            input_features_size * output_features_size,
+                            (input_features_size, -1))
+        )
+        self.register_buffer(
+            "b_xzrh",
+            case_tensor(case, "input_bias", output_features_size)
+        )
+        self.register_buffer(
+            "W_hzrh",
+            case_tensor(case, "recurrent_weights_float",
+                            hidden_size * output_features_size,
+                            (hidden_size, -1))
+        )
+        self.register_buffer(
+            "b_hzrh",
+            case_tensor(case, "recurrent_bias", output_features_size)
+        )
+        # 高/低精度只换激活函数，递推本身完全一样
+        # （两套近似实现搬到了 examples/rnnoise_activation.py）
+        self.sigmoid, self.tanh = pick(low_accuracy)
+        
+    def forward(self, x, hidden):
+        """喂一帧，返回 `(新隐状态 [H], detail)`。
+        detail 是中间量 dict（键名同 C）—— 随返回值给出，不存 self；协议行由调用方自己打。
+        
+        按 RNNoise C 实现方式递推**一帧**（对应 src/nnet.c: compute_generic_gru()）。
+        weights 布局 [z|r|h]，hidden / x 各自有 bias，不单独计算 R、Z、H_candidate。
+
+        递推和 examples/rnn_unit.c 的 local_compute_generic_gru() 一一对应，
+        中间量按同样的名字（zrh_recur / sigmoid / recur_tanh / h / state）放进返回的
+        dict，脚本才能按 [name#frame] 与 C 配对。
+
+        ★ 一次只吃**一帧**：整段序列的递推由调用方按帧循环，状态也由调用方自己存 ——
+        和 C 一样（C 每次也只处理一帧，状态是调用方传进来的数组）。
+        整网里就是 gru1 的输出喂 gru2、gru2 的输出喂 gru3，三个 gru 各存各的隐状态。
+
+        x:            [F]   这一帧的输入（不是整段序列）
+        hidden:       [H]   上一帧的隐状态
+
+        （激活档次由构造函数决定：`low_accuracy=True` 用本文件手写的多项式近似
+          = C 默认；`False` 用 torch.sigmoid / tanh = C 的 -DHIGH_ACCURACY。）
+
+        ★ 本函数**不打印**（2026-10-08 起）：返回 `(h, detail)`
+            h       这一帧算出的新隐状态 [H]，调用方把它喂给下一帧
+            detail  {项名: tensor}，键名与 C 的打印项逐字节一致，插入顺序也是 C 的顺序：
+                    zrh_recur -> sigmoid -> recur_tanh -> h -> state（state 与 h 同值）
+                    打哪几项、打到哪，由调用方决定。
+        """
+        hidden_size = hidden.shape[0]
+        
+        # 一次算出 zrh：三个权重（z / r / h）的输入投影一起算，公式里都和 x 相乘
+        zrh = x @ self.W_xzrh + self.b_xzrh          # compute_linear(input_weights, zrh, in, arch);
+        # 一次算出 recur：三个权重的递归投影也一起算，都和 hidden_t-1 相乘
+        recur = hidden @ self.W_hzrh + self.b_hzrh   # compute_linear(recurrent_weights, recur, state, arch);
+
+        # C: for (i=0;i<2*N;i++) zrh[i] += recur[i];
+        pre = zrh[:hidden_size*2] + recur[:hidden_size*2]
+
+        # C: compute_activation(zrh, zrh, 2*N, ACTIVATION_SIGMOID, arch);
+        # z 和 r 一起过 sigmoid；只覆盖前 2N 个，zrh[2*N:] 仍是候选状态的输入投影
+        zrh[:hidden_size*2] = self.sigmoid(pre)  # [H*2]，收敛到 (0, 1)
+
+        # 对应c代码
+        #   for (i=0;i<N;i++)
+        #       h[i] += recur[2*N+i]*r[i];
+        r = zrh[hidden_size:hidden_size*2]
+        # 注意上面那行 C 代码里 h 指向 zrh[2*N]，是复用了候选状态的输入投影，
+        # 所以这里必须补上 zrh[2*N:] 这一项（之前漏掉，导致和 C 不等价）
+        h_candidate = self.tanh(zrh[hidden_size*2:] + recur[hidden_size*2:]*r)
+
+        # 对应c代码
+        # for (i=0;i<N;i++)
+        #     h[i] = z[i]*state[i] + (1-z[i])*h[i];
+        # for (i=0;i<N;i++)
+        #     state[i] = h[i];
+        z = zrh[:hidden_size]
+        h = z * hidden + (1 - z) * h_candidate
+
+        # 中间量按 C 的打印项名打包返回（插入顺序 = C 的打印顺序）；本函数不再打印
+        detail = {
+            "zrh_recur": pre,
+            "sigmoid": zrh[:hidden_size*2],
+            "recur_tanh": h_candidate,
+            "h": h,
+            "state": h,
+        }
+        return h, detail
+        
 
 def gru_demo(out=sys.stdout):
     """教学 demo：随机权重 + 教材版递推（`do_gru()`），逐帧打印状态与输出。
 
     注意这里用的是**教材版**布局（9 组参数、`torch` 激活），**不是** RNNoise 的
-    [z|r|h] 布局 —— 后者是 `do_rnnoise_gru_step()` / `GRUScratch`，由
-    `examples/rnn_unit.py` 调。
+    [z|r|h] 布局 —— 后者是 `GRUMo`，由 `examples/rnn_unit.py` 调。
     """
     time_step = 2               # T
     batch_size = 3              # B

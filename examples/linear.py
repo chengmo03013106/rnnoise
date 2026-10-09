@@ -4,7 +4,7 @@
 
     Linear      一层全连接      y = x @ W + b       （对应 compute_linear()）
     DenseLayer  全连接 + sigmoid                    （整网输出层 dense_out / vad_dense）
-    Conv1D      带一帧记忆的全连接 + tanh            （对应 compute_generic_conv1d()）
+    Conv1D      带一帧记忆的全连接 + tanh（mem 由调用方经 forward 进出）（对应 compute_generic_conv1d()）
 
 这三个层被 conv1d / all 两个单元共用（gru.py 不用它们，GRU 的 [z|r|h] 布局
 是它自己的事），所以从 rnn_unit.py 抽出来放在这里，只留一份。
@@ -74,7 +74,8 @@ class DenseLayer(nn.Module):
         low_accuracy=True  -> rnnoise_activation 的多项式 sigmoid（= C 默认）
         low_accuracy=False -> torch.sigmoid（= C 的 -DHIGH_ACCURACY）
 
-    它自己没有参数（参数都在 self.linear 里），所以不是 nn.Module，只是个可调用对象。
+    它自己没有参数（参数都在 self.linear 子模块里）；继承 nn.Module 是为了让父模块
+    能把它注册成子模块 —— 这样 `.to()` / `state_dict()` 才认得到 self.linear 的权重。
     """
 
     def __init__(self, nb_input, nb_output, case, low_accuracy=True):
@@ -82,42 +83,41 @@ class DenseLayer(nn.Module):
         self.linear = Linear(nb_input, nb_output, case)
         self.active = pick(low_accuracy)[0]
 
-    def forward():
-        return self.active(self.linear(data))
-
-    def __call__(self, data): # 没有继承 nn.Module 使用这个函数
+    def forward(self, data):
         return self.active(self.linear(data))
 
 
 class Conv1D(nn.Module):
-    """带记忆的一维卷积：tmp = [mem, input] -> 线性 -> 激活 -> 把 tmp 尾部存回 mem。
+    """带记忆的一维卷积：`out, mem = net(data, mem)`。
 
-    对应 C 的 compute_generic_conv1d()：mem 长度 = nb_input - input_size
-    （即 (kernel_size - 1) 帧），每帧把最旧的一帧挤出去。
+    对应 C 的 compute_generic_conv1d()：
+        tmp  = [mem, data]        # mem 长度 = nb_input - input_size = (kernel_size-1) 帧
+        out  = active(linear(tmp))
+        mem' = tmp[input_size:]   # 把最旧的一帧挤出去（对应 C 的 RNN_COPY）
+
+    ★ **mem 由调用方持有、经 forward 进出**（不再是 `self.mem`）：静态图没有
+      "对象属性"这个概念，只有把状态做成图的输入/输出它才能跨帧延续
+      （同 LLM 的 KV cache）。调用方负责建初值，长度 = nb_input - input_size，
+      整网/C 侧都从全 0 开始。
 
     高/低精度只换激活函数：
         low_accuracy=True  -> rnnoise_activation 的多项式 tanh（= C 默认）
         low_accuracy=False -> torch.tanh（= C 的 -DHIGH_ACCURACY）
 
-    ★ 必须是 nn.Module 才可调用（`net(x)` 走 nn.Module.__call__ -> forward）。
-      裸类只写 forward 是**不能调用**的（会 TypeError: object is not callable）——
-      DenseLayer 那种裸类是显式写了 __call__ 才行。
+    ★ 必须是 nn.Module 才可调用（`net(data, mem)` 走 nn.Module.__call__ -> forward）。
+      裸类只写 forward 是**不能调用**的（会 TypeError: object is not callable）。
     """
 
     def __init__(self, nb_input, nb_output, case, input_size, low_accuracy=True):
         # input_size * kernel_size = nb_input
         super().__init__()
-        self.mem_size = nb_input - input_size
         self.input_size = input_size
-        self.mem = torch.zeros(self.mem_size)
         self.linear = Linear(nb_input, nb_output, case)
         self.active = pick(low_accuracy)[1]
 
-    def forward(self, data):
-        assert data.numel() == self.input_size
-        total = torch.cat([self.mem, data], dim=0)
-        self.mem = total[self.input_size:].clone()
-        return self.active(self.linear(total))
+    def forward(self, data, mem):
+        total = torch.cat([mem, data], dim=0)
+        return self.active(self.linear(total)), total[self.input_size:].clone()
 
 
 # ===================== 单元: conv1d =====================
@@ -136,12 +136,15 @@ def conv1d_demo(cases, low_accuracy=True, out=sys.stdout):
     for layer, in_size, nb_out in CONV_LAYERS:
         case = cases[layer]
         net = Conv1D(in_size * 3, nb_out, case, in_size, low_accuracy=low_accuracy)
+        # mem 由调用方持有：长度 = nb_input - input_size = (kernel_size-1) 帧。
+        # C 侧同样是 memset 成 0，所以这里从全 0 开始。
+        mem = torch.zeros(in_size * 3 - in_size, dtype=torch.float32)
         for frame, raw in enumerate(case["inputs"]):
             x = torch.tensor(raw, dtype=torch.float32)
-            out_data = net(x)
+            out_data, mem = net(x, mem)
             emit(layer, "out", frame, out_data[0], out)
-            # forward 里 mem 已经更新成 tmp 的尾部，和 C 的 RNN_COPY 一致
-            emit(layer, "mem", frame, net.mem, out)
+            # net 返回的 mem 就是 tmp 的尾部，和 C 的 RNN_COPY 一致
+            emit(layer, "mem", frame, mem, out)
 
 
 # ===================== 入口：线性层手工实验 =====================

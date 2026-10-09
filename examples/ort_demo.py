@@ -79,46 +79,10 @@ def load_toy(model_file):
 def main(argv):
     torch.set_printoptions(sci_mode=True, precision=8)
     torch.set_num_threads(1)  # 固定线程数，避免浮点累加顺序抖动
-    unit = 'conv1d'
-    paths, cases = load_unit_cases(unit, argv[2] if len(argv) > 2 else None)
-    model_file = 'toy.onnx'
+    paths, cases = load_unit_cases('all2', argv[2] if len(argv) > 2 else None)
+    model_file = './examples/conv1.onnx'
     load_toy(model_file)
     inference_demo(model_file, cases)
-    return 
-
-
-    hidden_size = 4
-    input_features_size = 4
-    output_features_size = 8
-    net = RNNoiseMo(input_features_size,hidden_size,output_features_size)
-    # 加载权重，将model.pth转换为自己的模型权重
-    # 如果模型的权重是使用多卡训练出来，我们需要去除权重中多的module. 具体操作可以见5.4节
-    # ❌ model = model.load_state_dict(torch.load(save_w_dir))
-
-    # 导出模型前，必须调用model.eval()或者model.train(False)
-    # net.eval() 
-
-    # dummy_input就是一个输入的实例，仅提供输入shape、type等信息 
-    batch_size = 1 # 随机的取值，当设置dynamic_axes后影响不大
-    dummy_input = torch.randn((batch_size, input_features_size), requires_grad=True) 
-    hidden = torch.randn((batch_size, hidden_size), dtype=torch.float32)
-
-    opset_version = onnx.defs.onnx_opset_version()
-
-    # 导出模型
-    # torch.onnx.export(model,        # 模型的名称
-    #               dummy_input,   # 一组实例化输入
-    #               onnx_file_name,   # 文件保存路径/名称
-    #               export_params=True,        #  如果指定为True或默认, 参数也会被导出. 如果你要导出一个没训练过的就设为 False.
-    #               opset_version=15, # ONNX 算子集的版本，当前已更新到15
-    #               do_constant_folding=True,  # 是否执行常量折叠优化
-    #               input_names = ['input','hidden'],   # 输入模型的张量的名称
-    #               output_names = ['output'], # 输出模型的张量的名称
-    #               # dynamic_axes将batch_size的维度指定为动态，
-    #               # 后续进行推理的数据可以与导出的dummy_input的batch_size不同
-    #               dynamic_axes={'input' : {0 : 'batch_size'},    
-    #                             'output' : {0 : 'batch_size'}}
-    #                             )
     return 0
 
 

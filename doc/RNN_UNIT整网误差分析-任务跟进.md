@@ -28,7 +28,7 @@
 |---|---|
 | `examples/rnn_unit.py:296` | `DenseLayer.active = torch.sigmoid` — **硬编码** |
 | `examples/rnn_unit.py:309` | `Conv1D.active = torch.tanh` — **硬编码** |
-| `examples/rnn_unit.py` | `gru_demo()` 经 `GRUScratch` 已支持 `--acc`；**上一行两个类不支持** |
+| `examples/rnn_unit.py` | `gru_demo()` 经 `GRUMo` 已支持 `--acc`；**上一行两个类不支持** |
 | `examples/rnn_unit.py:rnnoise_demo()` | 用户的 WIP。**帧循环末尾 `break` → 只跑第 0 帧**；`emit('vad', "out", frame, gains[0])` **误用了 gains**；协议名 `gains.out`/`vad.out`（C 是 `dense.gains`/`vad`）；**没有** emit `dense.in`；中间夹着非协议 `print(f'conv1 {frame}:...')` |
 | `examples/rnn_unit.c:conv_gru_unit()` | `all` 单元。串 `conv1→conv2→gru1/2/3→concat→dense/vad` ✓。但打的是 `[gruN.state#i]` **72 个**，而 `compute_generic_gru()` 只写了前 24 个（`N=CASE_GRU_N`），后 48 个是数组里的陈旧值；`gru_unit()` 那边打的是 **24**，两侧长度不一致。另外 `gruK_state` 声明成了真实模型的 `GRU_STATE_SIZE`(384) |
 | `examples/rnn_unit.c:conv_gru_unit()` | 调的是 `src/nnet.c` 的**正版** `compute_generic_gru()`，所以链路上**没有** `zrh_recur / sigmoid / recur_tanh / h` 这些内部量，只有最终 `state` |
@@ -87,7 +87,7 @@ dense_out / vad_dense  输入 96 → 2 / 1     （dense.json 只有参数）
 > **Q1 答案带来的简化**：既然可以动 `rnnoise_demo()`，就不必再另建一份镜像 harness 当主路径。
 > 主路径 = **修好后的 `rnnoise_demo()`**（跑"自回归/free-running"的端到端链路）；
 > teacher forcing 隔离因为要"从外部注入 C 的输入"，仍然需要一个**独立的小脚本**（Python 侧天然支持注入：
-> `Conv1D.forward(data)` / `GRUScratch.__call__(x)` 都是从外面喂的，`mem` / `hidden` 也可注入）。
+> `Conv1D.forward(data, mem)` / `GRUMo.__call__(x)` 都是从外面喂的，`mem` / `hidden` 也可注入）。
 
 ### 阶段 1｜拆文件 + 改名（纯重构，零行为变化）—— **2026-09-30 完成**
 
@@ -99,7 +99,7 @@ dense_out / vad_dense  输入 96 → 2 / 1     （dense.json 只有参数）
       **顺手改了签名**：`(zrh, hidden_size, recur)` → `(pre_act, out)`（原来那个签名要求调用方
       先做切片相加，用它当通用工具很别扭）
 - [x] `examples/gru_scratch.py` → `examples/gru.py`
-- [x] `rnn_unit.py` 的 import 改成 `from gru import GRUScratch as GRUScratch`
+- [x] `rnn_unit.py` 的 import 改成 `from gru import GRUMo as GRUMo`
 - [x] 全局搜 `gru_scratch` 残留：`doc/学习工具搭建手册.md`（树 + 4.3 表）、
       `doc/GRU计算过程误差对比统计.md`（4 处）、`.codebuddy/memory/MEMORY.md` 都已同步；
       只剩 `rnnoise_activation.py` 模块头里那份"原名对照"是故意留的
@@ -114,10 +114,10 @@ dense_out / vad_dense  输入 96 → 2 / 1     （dense.json 只有参数）
    **这是在我动手之前就坏的**（外部编辑导致），已恢复该 import。
    → 教训：**Python 的类型注解也是运行时求值的**，`nn` 没导入连模块都加载不了。
 2. `gru_demo()` 原来是坏的：`net(inputs_data, hidden_0, gru)` 里 `gru` 未定义；
-   而且它按"教材版 9 组参数 + 批量"写，与现在 `GRUScratch`（RNNoise 的 [z|r|h] 布局、
+   而且它按"教材版 9 组参数 + 批量"写，与现在 `GRUMo`（RNNoise 的 [z|r|h] 布局、
    **一次一帧**）根本不兼容 —— 即使补上 `gru` 也会 `ValueError: too many values to unpack`。
    已把它接到 `do_gru()`（教材版整段递推，与 `get_gru_params()` 是一对）上，`uv run examples/gru.py` 现在能跑。
-   `GRUScratch` 不再被 `gru_demo` 使用，但仍是 `rnn_unit.py` 的入口。
+   `GRUMo` 不再被 `gru_demo` 使用，但仍是 `rnn_unit.py` 的入口。
 
 ### 阶段 2｜tanh / sigmoid 开关全覆盖 —— **2026-09-30 完成**
 
@@ -142,9 +142,11 @@ dense_out / vad_dense  输入 96 → 2 / 1     （dense.json 只有参数）
       与 `[conv1.out#i]` 统一；Python 侧对齐成 `emit('vad', "out", ...)`
 - [x] Python 侧命名对齐：`gains.out` → `dense.gains`；新增 `dense.in`；`vad` 改用 `vad[0]`
       （原来错用了 `gains[0]`）
-- [x] 按 Q2 决定：`all` 链路**不**补 gru 内部量。为此给 `GRUScratch` / `do_rnnoise_gru_step`
-      加了 `detail` 开关：`True` 打 5 项（对应 C 的 `gru` 单元），`False` 只打 `state`
-      （对应 C 的 `conv_gru_unit`）。`rnnoise_demo` 用 `detail=False`
+- [x] 按 Q2 决定：`all` 链路**不**补 gru 内部量。
+      ★ **2026-10-08 起演进**：曾用 `detail` 开关控制打几项，现已彻底简化 ——
+      `gru.py` **不打印任何协议行**：中间量由 `GRUMo.forward()` 随返回值一起给出
+      （`h_out, detail = net(x, h_in)`），打哪几项由调用方决定（`rnn_unit.py: gru_demo()`）。
+      原因：trace / `torch.onnx.export` 的图里不能混进 Python 打印这种副作用。
 - [x] `rnnoise_demo()` 去掉帧循环末尾的 `break`（原来只跑第 0 帧）—— 这是你授权的"最小必要三处"之一
 - ✓ 验收：两侧都是 **128 个 key**，**键集完全相同**（`set(c) == set(py)` 为 True），
   **值个数不一致的 key = 0** ✓
@@ -258,7 +260,7 @@ for (int f = 0; f < CASE_NB_FRAMES; ++f)
 ### 阶段 6｜Agent B 独立复核 —— **2026-09-30 完成**
 
 - [x] 复核跟进文档的勾选真实性 —— 通过
-- [x] 复核代码 diff —— 通过（`padding_rn` 修复被判正确；`detail` 开关被认为必要而非过度设计）
+- [x] 复核代码 diff —— 通过（`padding_rn` 修复被判正确；`detail` 开关被认为必要而非过度设计；★ 2026-10-08 该开关已按需求移除，见上文）
 - [x] 复核精度报告的结论是否被数据支撑 —— **判"需修正"**，B 抓到了本次报告**最站不住的一条**：
       > 报告原写"低精度误差的主体是每帧激活近似、**不是轨迹分叉**"。
       > B 指出这与自身数据矛盾：`D_free/A_swap` = 2.55 / 4.49 / **6.52**，
@@ -275,7 +277,7 @@ for (int f = 0; f < CASE_NB_FRAMES; ++f)
 | 2 | "共模相消"与微基准 `C低−Py低=1.385e-04` 自相矛盾 | **部分采纳**。矛盾来自口径：网格最差值用的是人为铺满的 `[−8,+8]`，而网络 pre-act 只在 `[−1.01,+0.68]`。补了"两区间"对照后完全自洽（网络区间上 sigmoid `4.700e-05`、tanh `1.726e-04`，与端到端同量级）。**并补上可加性铁证**：`C低−torch ≈ (C低−Py低) + (Py多项式−精确)`，sigmoid 和 tanh 两组都成立（tanh 精确到 4 位）→ 共模相消**成立** |
 | 3 | "C高=0"表述不清 | **采纳**。改成"在 1601 点网格上逐位等于 float32 精确值，即**正确舍入**，不是数学真值零误差" |
 | 4 | 缺分位数 / 只报 max | **采纳**（列入报告 §8 遗留），本轮未做 |
-| 5 | `gru.py` 的 `low_accuracy` 默认值未确认 | **驳回**。实测 `rnn()` / `RNNScratch.__call__` / `do_gru()` / `do_rnnoise_gru_step()` / `GRUScratch.__call__` **默认值全是 `True`**，与 C 缺省对齐 |
+| 5 | `gru.py` 的 `low_accuracy` 默认值未确认 | **驳回**。实测 `rnn()` / `RNNScratch.__call__` / `do_gru()` / `GRUMo`（构造参数）**默认值全是 `True`**，与 C 缺省对齐 |
 | 6 | `check_sigmoid_diff` 是死代码 | **采纳**。给 `rnnoise_activation.py` 加了 `__main__`，现在 `uv run examples/rnnoise_activation.py` 可独立跑 |
 | 7 | 272/272 没抓到 `padding_rn` 的 bug，要补回归断言 | **采纳**。`err_all.py` 加了护栏：**高精度 `conv1.out` 必须 ≤1e-6**，否则判不通过（实测 1.490e-08 → 通过） |
 | 8 | C dump 契约改过（72→24 等），要确认下游同步 | **已核实**。`collect_all.sh` / `err_all.py` / `teacher_force.py` 都只按值个数 zip，不依赖长度；自检的"值个数四组一致"为"是" |

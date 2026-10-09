@@ -94,7 +94,7 @@ $$
   ① x_f = conv1.inputs[f]                                (4)
   ② tmp1 = [x_{f-2}, x_{f-1}, x_f]                       (12)   mem = 前两次调用留下的 [x_{f-2}, x_{f-1}]
      conv1.out[f] = tanh( W1 · tmp1 + b1 )               (8)    W1,b1 ← conv.json#conv1
-                  ↑ 代码：C `src/nnet.c:114-124`；Python `rnn_unit.py: Conv1D.forward`
+                  ↑ 代码：C `src/nnet.c:114-124`；Python `examples/linear.py: Conv1D.forward(data, mem)`
   ③ tmp2 = [conv1.out[f-2], conv1.out[f-1], conv1.out[f]] (24)  mem ← 前两次的 conv1.out
      conv2.out[f] = tanh( W2 · tmp2 + b2 )               (24)   W2,b2 ← conv.json#conv2
   ④ gru1: x = conv2.out[f], h = gru1_state (上一帧的自己)

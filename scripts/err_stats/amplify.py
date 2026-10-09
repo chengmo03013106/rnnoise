@@ -58,20 +58,28 @@ def run_chain(cases, low_accuracy, no_recurrence=False):
     conv1, conv2, grus, dense, vad = build_layers(cases, low_accuracy)
     out = collections.defaultdict(list)
     xs = torch.tensor(cases["conv1"]["inputs"], dtype=torch.float32)
+    # conv 的 mem 由调用方持有：长度 = nb_input - input_size
+    conv1_mem = torch.zeros(cases["conv1"]["nb_in"] * 2, dtype=torch.float32)
+    conv2_mem = torch.zeros(cases["conv1"]["nb_out"] * 2, dtype=torch.float32)
+    # gru 的隐状态同理（forward(x, hidden)）：三层各一份，宽度 = nb_out * 3
+    g_h = cases["conv1"]["nb_out"] * 3
+    hidden = [torch.zeros(g_h, dtype=torch.float32) for _ in grus]
 
     for f in range(NFRAMES):
-        c1 = conv1(xs[f])[0]
+        c1, conv1_mem = conv1(xs[f], conv1_mem)
+        c1 = c1[0]
         out["conv1.out"].append(c1)
-        c2 = conv2(c1)[0]
+        c2, conv2_mem = conv2(c1, conv2_mem)
+        c2 = c2[0]
         out["conv2.out"].append(c2)
 
         x = c2
         for k, g in enumerate(grus):
             if no_recurrence:
-                g.hidden = torch.zeros_like(g.hidden)
-            h = g(x, low_accuracy=low_accuracy, out=None, frame=f)
-            out["gru%d.state" % (k + 1)].append(h)
-            x = h
+                hidden[k] = torch.zeros_like(hidden[k])
+            hidden[k], _ = g(x, hidden[k])
+            out["gru%d.state" % (k + 1)].append(hidden[k])
+            x = hidden[k]
 
         di = torch.cat([c2] + [out["gru%d.state" % k][-1] for k in (1, 2, 3)])
         out["dense.in"].append(di)

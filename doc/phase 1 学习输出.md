@@ -430,7 +430,7 @@ assert torch.sigmoid(x) == (1.0 / (1.0 + torch.exp(-x))) # 通过
 任务: GRU神经网络计算过程误差对比统计
 背景：
 1. rnn_unit.c 文件中函数 local_compute_generic_gru() 已经包含了打印输出，打印函数 print_item，打印内容如代码中显示。
-2. rnn_unit.py 文件中引用 gru_scratch.py 中的 GRUScratch类，执行 do_rnnoise_gru() 函数，打印内容如代码中显示。python中激活函数 sigmoid，tanh 有两种实现，高精度 torch包中自带，低精度在 gru_scratch.py 中手工实现。
+2. rnn_unit.py 文件中引用 gru_scratch.py 中的 GRUMo类，执行 do_rnnoise_gru() 函数，打印内容如代码中显示。python中激活函数 sigmoid，tanh 有两种实现，高精度 torch包中自带，低精度在 gru_scratch.py 中手工实现。
 3. C代码中 高精度与低精度需要修改 Makefile.am AM_CFLAGS 变量区别， -DHIGH_ACCURACY 即高精度，否则是低精度。
 4. 统计 C，python 程序，同样是高精度的情况下，打印输出的值是否存在误差，记录误差。同样在低精度下，打印输出的几个值是否存在误差，记录误差值。
 5. 分别统计 C 代码/python代码中 高精度/低精度情况下，各自的 sigmoid(zrh+recur) 的 最大偏差和平均差
